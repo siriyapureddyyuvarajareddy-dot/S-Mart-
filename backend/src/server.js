@@ -57,6 +57,13 @@ app.get('*', (req, res, next) => {
 // Run DB Initialization and Start server
 async function startServer() {
   try {
+    const fs = require('fs');
+    console.log('[Static Assets] Checking frontend/dist path:', frontendDistPath);
+    console.log('[Static Assets] Exists:', fs.existsSync(frontendDistPath));
+    if (fs.existsSync(frontendDistPath)) {
+      console.log('[Static Assets] Files:', fs.readdirSync(frontendDistPath));
+    }
+    
     // 1. Initialize Supabase Database
     let dbConnected = true;
     try {
