@@ -1,8 +1,33 @@
 import React, { useState, useEffect, useContext } from 'react';
 import { AppContext, API_BASE } from '../App';
 import { 
-  Users, Truck, RefreshCw, UserCheck, DollarSign, Trash2, Edit2
+  Users, Truck, RefreshCw, UserCheck, DollarSign, Trash2, Edit2, BarChart3
 } from 'lucide-react';
+import { Line } from 'react-chartjs-2';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+  Filler
+} from 'chart.js';
+
+// Register ChartJS elements for sales trend graphing
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend,
+  Filler
+);
+
 
 export default function ManagerDashboard({ activeTab, setActiveTab }) {
   const { token, user, triggerToast } = useContext(AppContext);
@@ -12,6 +37,8 @@ export default function ManagerDashboard({ activeTab, setActiveTab }) {
   const [attendance, setAttendance] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
   const [expenses, setExpenses] = useState([]);
+  const [salesReport, setSalesReport] = useState({ dailySales: [], categorySales: [] });
+  const [salesStats, setSalesStats] = useState({ totalRevenue: 0, totalOrders: 0, avgOrderValue: 0 });
   const [loading, setLoading] = useState(true);
 
   // Modal/Form states
@@ -55,6 +82,17 @@ export default function ManagerDashboard({ activeTab, setActiveTab }) {
       // 3. Expenses
       const resExp = await fetch(`${API_BASE}/expenses`, { headers });
       if (resExp.ok) setExpenses(await resExp.json());
+      
+      // 4. Sales Reports
+      const resSales = await fetch(`${API_BASE}/analytics/sales-reports`, { headers });
+      if (resSales.ok) {
+        const salesData = await resSales.json();
+        setSalesReport({
+          dailySales: salesData.dailySales || [],
+          categorySales: salesData.categorySales || []
+        });
+        setSalesStats(salesData.stats || { totalRevenue: 0, totalOrders: 0, avgOrderValue: 0 });
+      }
       
     } catch (err) {
       console.error(err);
@@ -315,6 +353,15 @@ export default function ManagerDashboard({ activeTab, setActiveTab }) {
         >
           <DollarSign className="w-4 h-4" />
           Expenses
+        </button>
+        <button
+          onClick={() => setActiveTab('sales')}
+          className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-medium text-xs transition-all flex-shrink-0 cursor-pointer border-none ${
+            activeTab === 'sales' ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-100/50'
+          }`}
+        >
+          <BarChart3 className="w-4 h-4" />
+          Sales & Reports
         </button>
       </nav>
 
@@ -852,6 +899,162 @@ export default function ManagerDashboard({ activeTab, setActiveTab }) {
                   </tbody>
                 </table>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 5. SALES & REPORTS PANEL */}
+      {activeTab === 'sales' && (
+        <div className="space-y-6">
+          {/* Summary Cards */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="bg-slate-50 border border-slate-100 p-5 rounded-2xl shadow-sm">
+              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Total Revenue</p>
+              <p className="text-2xl font-black text-slate-800 mt-1">
+                ₹{parseFloat(salesStats.totalRevenue).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+              </p>
+              <span className="text-[10px] text-emerald-600 font-bold bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100 mt-2 inline-block">
+                All Transactions
+              </span>
+            </div>
+            <div className="bg-slate-50 border border-slate-100 p-5 rounded-2xl shadow-sm">
+              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Total Orders Logged</p>
+              <p className="text-2xl font-black text-slate-800 mt-1">
+                {salesStats.totalOrders}
+              </p>
+              <span className="text-[10px] text-blue-600 font-bold bg-blue-50 px-2 py-0.5 rounded border border-blue-100 mt-2 inline-block">
+                Counter & Online
+              </span>
+            </div>
+            <div className="bg-slate-50 border border-slate-100 p-5 rounded-2xl shadow-sm">
+              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Average Order Value</p>
+              <p className="text-2xl font-black text-slate-800 mt-1">
+                ₹{parseFloat(salesStats.avgOrderValue).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+              </p>
+              <span className="text-[10px] text-teal-600 font-bold bg-teal-50 px-2 py-0.5 rounded border border-teal-100 mt-2 inline-block">
+                Per Checkout
+              </span>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* Sales Trend Chart */}
+            <div className="lg:col-span-2 bg-white border border-slate-150 rounded-2xl p-5 shadow-sm">
+              <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider mb-4 border-b border-slate-100 pb-3">
+                Daily Sales Revenue Trend
+              </h3>
+              <div className="h-64 flex items-center justify-center">
+                {salesReport.dailySales && salesReport.dailySales.length > 0 ? (
+                  <Line 
+                    options={{
+                      responsive: true,
+                      maintainAspectRatio: false,
+                      plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                          callbacks: {
+                            label: (context) => `Revenue: ₹${context.raw}`
+                          }
+                        }
+                      },
+                      scales: {
+                        y: {
+                          beginAtZero: true,
+                          ticks: {
+                            callback: (val) => '₹' + val
+                          }
+                        }
+                      }
+                    }}
+                    data={{
+                      labels: salesReport.dailySales.map(d => d.date),
+                      datasets: [
+                        {
+                          label: 'Daily Revenue',
+                          data: salesReport.dailySales.map(d => d.revenue),
+                          borderColor: '#059669', // Emerald 600
+                          backgroundColor: 'rgba(5, 150, 105, 0.1)',
+                          tension: 0.3,
+                          fill: true
+                        }
+                      ]
+                    }}
+                  />
+                ) : (
+                  <p className="text-xs text-slate-400 font-bold">No sales data logged to plot trend.</p>
+                )}
+              </div>
+            </div>
+
+            {/* Category distribution */}
+            <div className="bg-white border border-slate-150 rounded-2xl p-5 shadow-sm">
+              <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider mb-3 border-b border-slate-100 pb-3">
+                Category Sales Breakdown
+              </h3>
+              <div className="divide-y divide-slate-100 overflow-y-auto max-h-[250px] pr-1">
+                {salesReport.categorySales && salesReport.categorySales.length > 0 ? (
+                  salesReport.categorySales.map((cat, idx) => (
+                    <div key={idx} className="py-3 flex justify-between items-center text-xs font-medium">
+                      <div>
+                        <p className="font-bold text-slate-800">{cat.category}</p>
+                        <p className="text-[10px] text-slate-400 font-bold mt-0.5">{cat.items_sold} Items Sold</p>
+                      </div>
+                      <span className="font-extrabold text-slate-700">
+                        ₹{parseFloat(cat.category_revenue).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      </span>
+                    </div>
+                  ))
+                ) : (
+                  <p className="text-xs text-slate-400 font-bold py-6 text-center">No category sales metrics available.</p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Day-Wise Sales Table */}
+          <div className="bg-white border border-slate-150 rounded-2xl p-5 shadow-sm">
+            <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider mb-4 border-b border-slate-100 pb-3">
+              Day-Wise Sales Performance Register
+            </h3>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 font-semibold text-slate-400 uppercase border-b border-slate-100">
+                    <th className="px-4 py-2.5">Date</th>
+                    <th className="px-4 py-2.5 text-center">Total Orders</th>
+                    <th className="px-4 py-2.5 text-center">Daily Revenue</th>
+                    <th className="px-4 py-2.5 text-right">Average Order Value</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
+                  {salesReport.dailySales && salesReport.dailySales.length > 0 ? (
+                    [...salesReport.dailySales].reverse().map((day, idx) => {
+                      const avg = day.orders_count > 0 ? day.revenue / day.orders_count : 0;
+                      return (
+                        <tr key={idx} className="hover:bg-slate-50/50">
+                          <td className="px-4 py-3 font-bold text-slate-800">
+                            {new Date(day.date).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
+                          </td>
+                          <td className="px-4 py-3 text-center font-bold text-slate-500">{day.orders_count}</td>
+                          <td className="px-4 py-3 text-center font-bold text-slate-800">
+                            ₹{parseFloat(day.revenue).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                          </td>
+                          <td className="px-4 py-3 text-right font-extrabold text-slate-600">
+                            ₹{parseFloat(avg.toFixed(2)).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  ) : (
+                    <tr>
+                      <td colSpan="4" className="px-4 py-8 text-center text-slate-400 font-bold">
+                        No day-wise sales logged.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
         </div>

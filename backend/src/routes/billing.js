@@ -1,13 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const mongoose = require('mongoose');
 const QRCode = require('qrcode');
-const Order = require('../models/Order');
-const Product = require('../models/Product');
-const Customer = require('../models/Customer');
-const User = require('../models/User');
-const StockLog = require('../models/StockLog');
-const Notification = require('../models/Notification');
+const { supabase } = require('../config/db');
 const mockDb = require('../utils/mockDb');
 const { authenticateJWT, restrictTo } = require('../middleware/auth');
 
@@ -20,7 +14,7 @@ router.post('/checkout', authenticateJWT, restrictTo('manager', 'cashier'), asyn
   }
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -158,14 +152,19 @@ router.post('/checkout', authenticateJWT, restrictTo('manager', 'cashier'), asyn
       });
     }
 
-    // ONLINE MODE
+    // ONLINE MODE (SUPABASE)
     let subtotal = 0;
     let totalGst = 0;
     let totalDiscount = 0;
     const processedItems = [];
     
     for (const item of items) {
-      const product = await Product.findById(item.productId);
+      const { data: product } = await supabase
+        .from('products')
+        .select('*')
+        .eq('id', item.productId)
+        .maybeSingle();
+
       if (!product) {
         return res.status(404).json({ error: `Product ID ${item.productId} not found` });
       }
@@ -187,7 +186,7 @@ router.post('/checkout', authenticateJWT, restrictTo('manager', 'cashier'), asyn
       totalDiscount += itemDiscount;
       
       processedItems.push({
-        productId: product._id,
+        productId: product.id,
         name: product.name,
         quantity: item.quantity,
         price: itemPrice,
@@ -202,70 +201,112 @@ router.post('/checkout', authenticateJWT, restrictTo('manager', 'cashier'), asyn
     let loyaltyDiscount = 0;
     
     if (customerId) {
-      const customerRow = await Customer.findById(customerId);
+      const { data: customerRow } = await supabase
+        .from('customers')
+        .select('*')
+        .eq('id', customerId)
+        .maybeSingle();
+
       if (customerRow) {
-        if (redeemPoints === true && customerRow.loyaltyPoints > 0) {
-          const redeemable = Math.min(customerRow.loyaltyPoints, Math.floor(finalAmount));
+        let currentPoints = customerRow.loyalty_points || 0;
+        if (redeemPoints === true && currentPoints > 0) {
+          const redeemable = Math.min(currentPoints, Math.floor(finalAmount));
           loyaltyDiscount = redeemable;
           finalAmount -= loyaltyDiscount;
-          customerRow.loyaltyPoints -= redeemable;
+          currentPoints -= redeemable;
         }
         const pointsEarned = Math.floor(finalAmount / 100);
         if (pointsEarned > 0) {
-          customerRow.loyaltyPoints += pointsEarned;
+          currentPoints += pointsEarned;
         }
-        if (customerRow.loyaltyPoints > 500) customerRow.tier = 'Platinum';
-        else if (customerRow.loyaltyPoints > 200) customerRow.tier = 'Gold';
-        else customerRow.tier = 'Silver';
-        await customerRow.save();
+        let tier = 'Silver';
+        if (currentPoints > 500) tier = 'Platinum';
+        else if (currentPoints > 200) tier = 'Gold';
+        
+        await supabase
+          .from('customers')
+          .update({ loyalty_points: currentPoints, tier })
+          .eq('id', customerId);
       }
     }
     
     for (const item of processedItems) {
-      const product = await Product.findById(item.productId);
-      product.quantity -= item.quantity;
-      await product.save();
+      // Deduct stock
+      const { data: prod } = await supabase
+        .from('products')
+        .select('*')
+        .eq('id', item.productId)
+        .maybeSingle();
+
+      const newQty = Math.max(0, prod.quantity - item.quantity);
+      await supabase
+        .from('products')
+        .update({ quantity: newQty })
+        .eq('id', item.productId);
       
-      await StockLog.create({
-        productId: item.productId,
-        changeQty: -item.quantity,
+      // Log stock log
+      await supabase.from('stock_logs').insert({
+        product_id: item.productId,
+        change_qty: -item.quantity,
         reason: 'sale',
-        userId: req.user.id
+        user_id: req.user.id
       });
       
-      if (product.quantity <= product.lowStockThreshold) {
-        await Notification.create({
-          roleTarget: 'inventory',
+      if (newQty <= (prod.low_stock_threshold || 10)) {
+        await supabase.from('notifications').insert({
           title: 'Low Stock Alert',
-          message: `Product "${product.name}" is low on stock (${product.quantity} ${product.unit} remaining)`,
+          message: `Product "${prod.name}" is low on stock (${newQty} ${prod.unit} remaining)`,
           type: 'low_stock'
         });
       }
     }
     
     const totalDiscountApplied = totalDiscount + loyaltyDiscount;
-    const newOrder = await Order.create({
-      customerId: customerId || null,
-      cashierId: req.user.id,
-      orderType: 'counter',
-      totalAmount: subtotal,
-      discountAmount: totalDiscountApplied,
-      gstAmount: totalGst,
-      finalAmount: Math.max(0, finalAmount),
-      status: 'completed',
-      paymentMethod,
-      paymentStatus: 'completed',
-      items: processedItems
-    });
+    const { data: newOrder, error: oErr } = await supabase
+      .from('orders')
+      .insert({
+        customer_id: customerId || null,
+        cashier_id: req.user.id,
+        order_type: 'counter',
+        total_amount: subtotal,
+        discount_amount: totalDiscountApplied,
+        gst_amount: totalGst,
+        final_amount: Math.max(0, finalAmount),
+        status: 'completed',
+        payment_method: paymentMethod,
+        payment_status: 'completed'
+      })
+      .select()
+      .single();
+
+    if (oErr || !newOrder) {
+      throw oErr || new Error('Failed to create order');
+    }
+
+    const itemsToInsert = processedItems.map(it => ({
+      order_id: newOrder.id,
+      product_id: it.productId,
+      quantity: it.quantity,
+      price: it.price,
+      gst_rate: it.gstRate,
+      gst_amount: it.gstAmount,
+      discount_amount: it.discountAmount,
+      subtotal: it.subtotal
+    }));
+
+    const { error: itemsErr } = await supabase
+      .from('order_items')
+      .insert(itemsToInsert);
+    if (itemsErr) throw itemsErr;
     
-    const invoiceUrl = `http://localhost:5000/api/billing/invoice/${newOrder._id}`;
+    const invoiceUrl = `http://localhost:5000/api/billing/invoice/${newOrder.id}`;
     const qrCodeBase64 = await QRCode.toDataURL(invoiceUrl);
     
     res.status(201).json({
       success: true,
       message: 'Transaction completed successfully',
-      orderId: newOrder._id,
-      invoiceNumber: `SMART-INV-${String(newOrder._id).slice(-6).toUpperCase()}`,
+      orderId: newOrder.id,
+      invoiceNumber: `SMART-INV-${String(newOrder.id).slice(-6).toUpperCase()}`,
       subtotal,
       gstAmount: totalGst,
       discountAmount: totalDiscountApplied,
@@ -310,7 +351,7 @@ router.post('/verify-payment', authenticateJWT, async (req, res) => {
   }
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -372,24 +413,34 @@ router.post('/verify-payment', authenticateJWT, async (req, res) => {
       return res.json({ success: true, message: 'Online order processed successfully', orderId: newOrderId });
     }
 
-    // ONLINE MODE
+    // ONLINE MODE (SUPABASE)
     const processedItems = [];
     for (const item of items) {
-      const product = await Product.findById(item.productId);
+      const { data: product } = await supabase
+        .from('products')
+        .select('*')
+        .eq('id', item.productId)
+        .maybeSingle();
+
       if (!product || product.quantity < item.quantity) {
         return res.status(400).json({ error: `Product "${item.name}" is out of stock or insufficient.` });
       }
-      product.quantity -= item.quantity;
-      await product.save();
       
-      await StockLog.create({
-        productId: item.productId,
-        changeQty: -item.quantity,
+      const newQty = Math.max(0, product.quantity - item.quantity);
+      await supabase
+        .from('products')
+        .update({ quantity: newQty })
+        .eq('id', item.productId);
+      
+      await supabase.from('stock_logs').insert({
+        product_id: item.productId,
+        change_qty: -item.quantity,
         reason: 'sale',
-        userId: req.user.id
+        user_id: req.user.id
       });
+      
       processedItems.push({
-        productId: product._id,
+        productId: product.id,
         quantity: item.quantity,
         price: parseFloat(item.price),
         gstRate: parseFloat(item.gstRate || 18.0),
@@ -398,28 +449,62 @@ router.post('/verify-payment', authenticateJWT, async (req, res) => {
         subtotal: parseFloat(item.subtotal)
       });
     }
+    
     if (customerId) {
-      const customer = await Customer.findById(customerId);
+      const { data: customer } = await supabase
+        .from('customers')
+        .select('*')
+        .eq('id', customerId)
+        .maybeSingle();
+
       if (customer) {
-        customer.loyaltyPoints += Math.floor(parseFloat(finalAmount) / 100);
-        await customer.save();
+        const extraPoints = Math.floor(parseFloat(finalAmount) / 100);
+        await supabase
+          .from('customers')
+          .update({ loyalty_points: (customer.loyalty_points || 0) + extraPoints })
+          .eq('id', customerId);
       }
     }
-    const newOrder = await Order.create({
-      customerId: customerId || null,
-      orderType: 'online',
-      totalAmount: parseFloat(totalAmount),
-      discountAmount: parseFloat(discountAmount || 0.0),
-      gstAmount: parseFloat(gstAmount || 0.0),
-      finalAmount: parseFloat(finalAmount),
-      status: 'processing',
-      paymentMethod: 'razorpay',
-      paymentStatus: 'completed',
-      razorpayOrderId,
-      razorpayPaymentId,
-      items: processedItems
-    });
-    res.json({ success: true, message: 'Online order processed successfully', orderId: newOrder._id });
+    
+    const { data: newOrder, error: oErr } = await supabase
+      .from('orders')
+      .insert({
+        customer_id: customerId || null,
+        order_type: 'online',
+        total_amount: parseFloat(totalAmount),
+        discount_amount: parseFloat(discountAmount || 0.0),
+        gst_amount: parseFloat(gstAmount || 0.0),
+        final_amount: parseFloat(finalAmount),
+        status: 'processing',
+        payment_method: 'razorpay',
+        payment_status: 'completed',
+        razorpay_order_id: razorpayOrderId || null,
+        razorpay_payment_id: razorpayPaymentId || null
+      })
+      .select()
+      .single();
+
+    if (oErr || !newOrder) {
+      throw oErr || new Error('Failed to create online order');
+    }
+
+    const itemsToInsert = processedItems.map(it => ({
+      order_id: newOrder.id,
+      product_id: it.productId,
+      quantity: it.quantity,
+      price: it.price,
+      gst_rate: it.gstRate,
+      gst_amount: it.gstAmount,
+      discount_amount: it.discountAmount,
+      subtotal: it.subtotal
+    }));
+
+    const { error: itemsErr } = await supabase
+      .from('order_items')
+      .insert(itemsToInsert);
+    if (itemsErr) throw itemsErr;
+    
+    res.json({ success: true, message: 'Online order processed successfully', orderId: newOrder.id });
   } catch (error) {
     console.error('Verify payment error:', error);
     res.status(500).json({ error: 'Failed to verify payment' });
@@ -431,7 +516,7 @@ router.get('/invoice/:orderId', authenticateJWT, async (req, res) => {
   const { orderId } = req.params;
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -489,46 +574,52 @@ router.get('/invoice/:orderId', authenticateJWT, async (req, res) => {
       });
     }
 
-    // ONLINE MODE
-    const order = await Order.findById(orderId)
-      .populate({
-        path: 'customerId',
-        populate: { path: 'userId', select: 'name' }
-      })
-      .populate('items.productId', 'name unit');
+    // ONLINE MODE (SUPABASE)
+    const { data: order, error: oErr } = await supabase
+      .from('orders')
+      .select('*, customers(phone, users(name))')
+      .eq('id', orderId)
+      .maybeSingle();
       
-    if (!order) {
+    if (oErr || !order) {
       return res.status(404).json({ error: 'Order / Invoice not found' });
     }
     
-    const formattedItems = order.items.map(it => ({
-      productId: it.productId?._id,
-      name: it.productId?.name || 'N/A',
-      unit: it.productId?.unit || 'Pieces',
+    const { data: orderItems, error: itemsErr } = await supabase
+      .from('order_items')
+      .select('*, products(name, unit)')
+      .eq('order_id', orderId);
+
+    if (itemsErr) throw itemsErr;
+    
+    const formattedItems = orderItems.map(it => ({
+      productId: it.product_id,
+      name: it.products ? it.products.name : 'N/A',
+      unit: it.products ? it.products.unit : 'Pieces',
       quantity: it.quantity,
-      price: it.price,
-      gst_rate: it.gstRate,
-      gst_amount: it.gstAmount,
-      discount_amount: it.discountAmount,
-      subtotal: it.subtotal
+      price: parseFloat(it.price),
+      gst_rate: parseFloat(it.gst_rate),
+      gst_amount: parseFloat(it.gst_amount),
+      discount_amount: parseFloat(it.discount_amount),
+      subtotal: parseFloat(it.subtotal)
     }));
     
     res.json({
       order: {
-        id: order._id,
-        order_type: order.orderType,
-        total_amount: order.totalAmount,
-        discount_amount: order.discountAmount,
-        gst_amount: order.gstAmount,
-        final_amount: order.finalAmount,
+        id: order.id,
+        order_type: order.order_type,
+        total_amount: parseFloat(order.total_amount),
+        discount_amount: parseFloat(order.discount_amount || 0),
+        gst_amount: parseFloat(order.gst_amount || 0),
+        final_amount: parseFloat(order.final_amount),
         status: order.status,
-        payment_method: order.paymentMethod,
-        payment_status: order.paymentStatus,
-        razorpay_order_id: order.razorpayOrderId,
-        razorpay_payment_id: order.razorpayPaymentId,
-        created_at: order.createdAt,
-        customer_phone: order.customerId?.phone || '',
-        customer_name: order.customerId?.userId?.name || ''
+        payment_method: order.payment_method,
+        payment_status: order.payment_status,
+        razorpay_order_id: order.razorpay_order_id,
+        razorpay_payment_id: order.razorpay_payment_id,
+        created_at: order.created_at,
+        customer_phone: order.customers ? order.customers.phone : '',
+        customer_name: order.customers && order.customers.users ? order.customers.users.name : ''
       },
       items: formattedItems
     });

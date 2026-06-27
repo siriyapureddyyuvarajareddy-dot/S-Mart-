@@ -45,12 +45,12 @@ app.get('/health', (req, res) => {
 // Run DB Initialization and Start server
 async function startServer() {
   try {
-    // 1. Initialize MongoDB Database
+    // 1. Initialize Supabase Database
     let dbConnected = true;
     try {
       await initializeDatabase();
     } catch (err) {
-      console.warn('[Database] MongoDB connection failed. Running in offline mode.');
+      console.warn('[Database] Supabase connection failed. Running in offline mode.');
       dbConnected = false;
     }
     
@@ -58,17 +58,21 @@ async function startServer() {
     if (process.argv.includes('--test')) {
       console.log('[Test Mode] Server bootstrap check completed successfully.');
       if (dbConnected) {
-        const User = require('./models/User');
-        const user = await User.findOne({ username: 'manager' });
+        const { supabase } = require('./config/db');
+        const { data: user, error } = await supabase
+          .from('users')
+          .select('*')
+          .eq('username', 'manager')
+          .single();
         if (user && user.name === 'Manager User') {
           console.log('[Test Mode] Database seed verification passed.');
           process.exit(0);
         } else {
-          console.error('[Test Mode] Database verification failed. User not found.');
+          console.error('[Test Mode] Database verification failed. User not found.', error ? error.message : '');
           process.exit(1);
         }
       } else {
-        console.log('[Test Mode] Skipped database query check because MongoDB server is not running locally.');
+        console.log('[Test Mode] Skipped database query check because database server is offline.');
         process.exit(0);
       }
     }

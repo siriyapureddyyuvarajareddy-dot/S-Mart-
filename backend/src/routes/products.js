@@ -1,9 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const mongoose = require('mongoose');
-const Product = require('../models/Product');
-const StockLog = require('../models/StockLog');
-const Notification = require('../models/Notification');
+const { supabase } = require('../config/db');
 const mockDb = require('../utils/mockDb');
 const { authenticateJWT, restrictTo } = require('../middleware/auth');
 
@@ -36,7 +33,7 @@ router.get('/', authenticateJWT, async (req, res) => {
   const { search, category, lowStock, expired } = req.query;
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -86,44 +83,52 @@ router.get('/', authenticateJWT, async (req, res) => {
       return res.json(formatted);
     }
 
-    // ONLINE MODE
-    const filter = {};
-    if (search) {
-      filter.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { barcode: search },
-        { sku: search }
-      ];
-    }
+    // ONLINE MODE (SUPABASE)
+    let query = supabase
+      .from('products')
+      .select('*, suppliers(name)')
+      .order('created_at', { ascending: false });
+      
     if (category) {
-      filter.category = category;
-    }
-    if (lowStock === 'true') {
-      filter.$expr = { $lte: ['$quantity', '$lowStockThreshold'] };
-    }
-    if (expired === 'true') {
-      const today = new Date().toISOString().split('T')[0];
-      filter.expiryDate = { $ne: null, $lt: today };
+      query = query.eq('category', category);
     }
     
-    const products = await Product.find(filter)
-      .populate('supplierId', 'name')
-      .sort({ createdAt: -1 });
-      
+    if (expired === 'true') {
+      const today = new Date().toISOString().split('T')[0];
+      query = query.not('expiry_date', 'is', null).lt('expiry_date', today);
+    }
+    
+    let { data: products, error } = await query;
+    if (error) throw error;
+    
+    // JS Filtering for search query and low stock check
+    if (search) {
+      const s = search.toLowerCase();
+      products = products.filter(p => 
+        p.name.toLowerCase().includes(s) || 
+        p.barcode === search || 
+        p.sku === search
+      );
+    }
+    
+    if (lowStock === 'true') {
+      products = products.filter(p => p.quantity <= (p.low_stock_threshold || 10));
+    }
+    
     const formatted = products.map(p => ({
-      id: p._id,
+      id: p.id,
       name: p.name,
       barcode: p.barcode,
       sku: p.sku,
       category: p.category,
-      price: p.price,
+      price: parseFloat(p.price),
       quantity: p.quantity,
       unit: p.unit,
-      low_stock_threshold: p.lowStockThreshold,
-      expiry_date: p.expiryDate,
-      supplier_id: p.supplierId?._id,
-      supplier_name: p.supplierId?.name,
-      created_at: p.createdAt
+      low_stock_threshold: p.low_stock_threshold,
+      expiry_date: p.expiry_date,
+      supplier_id: p.supplier_id,
+      supplier_name: p.suppliers ? p.suppliers.name : 'N/A',
+      created_at: p.created_at
     }));
     
     res.json(formatted);
@@ -138,7 +143,7 @@ router.get('/barcode/:barcode', authenticateJWT, async (req, res) => {
   const { barcode } = req.params;
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -162,25 +167,30 @@ router.get('/barcode/:barcode', authenticateJWT, async (req, res) => {
       });
     }
 
-    // ONLINE MODE
-    const product = await Product.findOne({ barcode: barcode.trim() });
-    if (!product) {
+    // ONLINE MODE (SUPABASE)
+    const { data: product, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('barcode', barcode.trim())
+      .maybeSingle();
+
+    if (error || !product) {
       return res.status(404).json({ error: `Product with barcode ${barcode} not found` });
     }
     
     res.json({
-      id: product._id,
+      id: product.id,
       name: product.name,
       barcode: product.barcode,
       sku: product.sku,
       category: product.category,
-      price: product.price,
+      price: parseFloat(product.price),
       quantity: product.quantity,
       unit: product.unit,
-      low_stock_threshold: product.lowStockThreshold,
-      expiry_date: product.expiryDate,
-      supplier_id: product.supplierId,
-      created_at: product.createdAt
+      low_stock_threshold: product.low_stock_threshold,
+      expiry_date: product.expiry_date,
+      supplier_id: product.supplier_id,
+      created_at: product.created_at
     });
   } catch (error) {
     console.error('Fetch by barcode error:', error);
@@ -197,7 +207,7 @@ router.post('/', authenticateJWT, restrictTo('manager', 'inventory'), async (req
   }
 
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -252,8 +262,13 @@ router.post('/', authenticateJWT, restrictTo('manager', 'inventory'), async (req
       });
     }
 
-    // ONLINE MODE
-    const duplicate = await Product.findOne({ name: name.trim() });
+    // ONLINE MODE (SUPABASE)
+    const { data: duplicate } = await supabase
+      .from('products')
+      .select('*')
+      .eq('name', name.trim())
+      .maybeSingle();
+
     if (duplicate) {
       return res.status(400).json({ error: `Product with name "${name}" already registered` });
     }
@@ -262,38 +277,46 @@ router.post('/', authenticateJWT, restrictTo('manager', 'inventory'), async (req
     const barcode = generateNewBarcode(seed);
     const sku = `SKU-${category.slice(0, 3).toUpperCase()}-${seed}`;
     
-    const newProduct = await Product.create({
-      name: name.trim(),
-      barcode,
-      sku,
-      category,
-      price: parseFloat(price),
-      quantity: parseInt(quantity),
-      unit,
-      lowStockThreshold: parseInt(lowStockThreshold || 15),
-      expiryDate: expiryDate || null,
-      supplierId: supplierId || null
-    });
+    const { data: newProduct, error: prodErr } = await supabase
+      .from('products')
+      .insert({
+        name: name.trim(),
+        barcode,
+        sku,
+        category,
+        price: parseFloat(price),
+        quantity: parseInt(quantity),
+        unit,
+        low_stock_threshold: parseInt(lowStockThreshold || 15),
+        expiry_date: expiryDate || null,
+        supplier_id: supplierId || null
+      })
+      .select()
+      .single();
+      
+    if (prodErr || !newProduct) {
+      throw prodErr || new Error('Failed to create product');
+    }
     
-    await StockLog.create({
-      productId: newProduct._id,
-      changeQty: parseInt(quantity),
+    await supabase.from('stock_logs').insert({
+      product_id: newProduct.id,
+      change_qty: parseInt(quantity),
       reason: 'restock',
-      userId: req.user.id
+      user_id: req.user.id
     });
     
     res.status(201).json({
-      id: newProduct._id,
+      id: newProduct.id,
       name: newProduct.name,
       barcode: newProduct.barcode,
       sku: newProduct.sku,
       category: newProduct.category,
-      price: newProduct.price,
+      price: parseFloat(newProduct.price),
       quantity: newProduct.quantity,
       unit: newProduct.unit,
-      low_stock_threshold: newProduct.lowStockThreshold,
-      expiry_date: newProduct.expiryDate,
-      created_at: newProduct.createdAt
+      low_stock_threshold: newProduct.low_stock_threshold,
+      expiry_date: newProduct.expiry_date,
+      created_at: newProduct.created_at
     });
   } catch (error) {
     console.error('Create product error:', error);
@@ -307,7 +330,7 @@ router.put('/:id', authenticateJWT, restrictTo('manager', 'inventory'), async (r
   const { name, price, quantity, unit, lowStockThreshold, expiryDate, supplierId, category } = req.body;
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -356,9 +379,14 @@ router.put('/:id', authenticateJWT, restrictTo('manager', 'inventory'), async (r
       });
     }
 
-    // ONLINE MODE
-    const product = await Product.findById(id);
-    if (!product) {
+    // ONLINE MODE (SUPABASE)
+    const { data: product, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error || !product) {
       return res.status(404).json({ error: 'Product not found' });
     }
     
@@ -366,39 +394,44 @@ router.put('/:id', authenticateJWT, restrictTo('manager', 'inventory'), async (r
     const newQty = quantity !== undefined ? parseInt(quantity) : oldQty;
     const qtyChange = newQty - oldQty;
     
-    product.name = name ? name.trim() : product.name;
-    product.category = category || product.category;
-    product.price = price !== undefined ? parseFloat(price) : product.price;
-    product.quantity = newQty;
-    product.unit = unit || product.unit;
-    product.lowStockThreshold = lowStockThreshold !== undefined ? parseInt(lowStockThreshold) : product.lowStockThreshold;
-    product.expiryDate = expiryDate !== undefined ? expiryDate : product.expiryDate;
-    product.supplierId = supplierId !== undefined ? supplierId : product.supplierId;
-    
-    await product.save();
+    const { error: updateErr } = await supabase
+      .from('products')
+      .update({
+        name: name ? name.trim() : product.name,
+        category: category || product.category,
+        price: price !== undefined ? parseFloat(price) : product.price,
+        quantity: newQty,
+        unit: unit || product.unit,
+        low_stock_threshold: lowStockThreshold !== undefined ? parseInt(lowStockThreshold) : product.low_stock_threshold,
+        expiry_date: expiryDate !== undefined ? expiryDate : product.expiry_date,
+        supplier_id: supplierId !== undefined ? supplierId : product.supplier_id
+      })
+      .eq('id', id);
+
+    if (updateErr) throw updateErr;
     
     if (qtyChange !== 0) {
       const reason = qtyChange > 0 ? 'restock' : 'adjustment';
-      await StockLog.create({
-        productId: product._id,
-        changeQty: qtyChange,
+      await supabase.from('stock_logs').insert({
+        product_id: product.id,
+        change_qty: qtyChange,
         reason,
-        userId: req.user.id
+        user_id: req.user.id
       });
     }
     
     res.json({
-      id: product._id,
-      name: product.name,
+      id: product.id,
+      name: name ? name.trim() : product.name,
       barcode: product.barcode,
       sku: product.sku,
-      category: product.category,
-      price: product.price,
-      quantity: product.quantity,
-      unit: product.unit,
-      low_stock_threshold: product.lowStockThreshold,
-      expiry_date: product.expiryDate,
-      created_at: product.createdAt
+      category: category || product.category,
+      price: price !== undefined ? parseFloat(price) : parseFloat(product.price),
+      quantity: newQty,
+      unit: unit || product.unit,
+      low_stock_threshold: lowStockThreshold !== undefined ? parseInt(lowStockThreshold) : product.low_stock_threshold,
+      expiry_date: expiryDate !== undefined ? expiryDate : product.expiry_date,
+      created_at: product.created_at
     });
   } catch (error) {
     console.error('Update product error:', error);
@@ -416,7 +449,7 @@ router.post('/:id/adjust', authenticateJWT, restrictTo('manager', 'inventory', '
   }
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -462,29 +495,37 @@ router.post('/:id/adjust', authenticateJWT, restrictTo('manager', 'inventory', '
       });
     }
 
-    // ONLINE MODE
-    const product = await Product.findById(id);
-    if (!product) {
+    // ONLINE MODE (SUPABASE)
+    const { data: product, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error || !product) {
       return res.status(404).json({ error: 'Product not found' });
     }
     
     const newQty = Math.max(0, product.quantity + parseInt(amount));
     const realChange = newQty - product.quantity;
     
-    product.quantity = newQty;
-    await product.save();
+    const { error: updateErr } = await supabase
+      .from('products')
+      .update({ quantity: newQty })
+      .eq('id', id);
+
+    if (updateErr) throw updateErr;
     
     if (realChange !== 0) {
-      await StockLog.create({
-        productId: product._id,
-        changeQty: realChange,
+      await supabase.from('stock_logs').insert({
+        product_id: product.id,
+        change_qty: realChange,
         reason,
-        userId: req.user.id
+        user_id: req.user.id
       });
       
-      if (newQty <= product.lowStockThreshold) {
-        await Notification.create({
-          roleTarget: 'inventory',
+      if (newQty <= (product.low_stock_threshold || 10)) {
+        await supabase.from('notifications').insert({
           title: 'Low Stock Alert',
           message: `Product "${product.name}" is low on stock (${newQty} ${product.unit} remaining)`,
           type: 'low_stock'
@@ -493,10 +534,10 @@ router.post('/:id/adjust', authenticateJWT, restrictTo('manager', 'inventory', '
     }
     
     res.json({
-      id: product._id,
+      id: product.id,
       name: product.name,
-      price: product.price,
-      quantity: product.quantity,
+      price: parseFloat(product.price),
+      quantity: newQty,
       unit: product.unit
     });
   } catch (error) {
@@ -510,7 +551,7 @@ router.delete('/:id', authenticateJWT, restrictTo('manager', 'inventory'), async
   const { id } = req.params;
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -523,13 +564,18 @@ router.delete('/:id', authenticateJWT, restrictTo('manager', 'inventory'), async
       return res.json({ success: true, message: `Product "${p.name}" successfully deleted.` });
     }
 
-    // ONLINE MODE
-    const product = await Product.findById(id);
-    if (!product) {
+    // ONLINE MODE (SUPABASE)
+    const { data: product, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error || !product) {
       return res.status(404).json({ error: 'Product not found' });
     }
     
-    await Product.findByIdAndDelete(id);
+    await supabase.from('products').delete().eq('id', id);
     res.json({ success: true, message: `Product "${product.name}" successfully deleted.` });
   } catch (error) {
     console.error('Delete product error:', error);

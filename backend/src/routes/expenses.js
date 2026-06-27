@@ -1,14 +1,13 @@
 const express = require('express');
 const router = express.Router();
-const mongoose = require('mongoose');
-const Expense = require('../models/Expense');
+const { supabase } = require('../config/db');
 const mockDb = require('../utils/mockDb');
 const { authenticateJWT, restrictTo } = require('../middleware/auth');
 
 // 1. Get Expenses (Managers and Admins)
 router.get('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -24,16 +23,22 @@ router.get('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
       return res.json(formatted);
     }
 
-    // ONLINE MODE
-    const expenses = await Expense.find().sort({ date: -1 });
+    // ONLINE MODE (SUPABASE)
+    const { data: expenses, error } = await supabase
+      .from('expenses')
+      .select('*')
+      .order('date', { ascending: false });
+      
+    if (error) throw error;
+
     const formatted = expenses.map(e => ({
-      id: e._id,
+      id: e.id,
       title: e.title,
       category: e.category,
-      amount: e.amount,
+      amount: parseFloat(e.amount),
       description: e.description,
       date: e.date,
-      created_by: e.createdBy
+      created_by: e.created_by
     }));
     res.json(formatted);
   } catch (error) {
@@ -51,7 +56,7 @@ router.post('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
   }
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     const userId = req.user.id || 'mock_user_1';
     
     if (isOffline) {
@@ -81,24 +86,32 @@ router.post('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
       });
     }
 
-    // ONLINE MODE
-    const expense = await Expense.create({
-      title: title.trim(),
-      category: category.trim(),
-      amount: Number(amount),
-      description: description || '',
-      date: date ? new Date(date) : new Date(),
-      createdBy: userId
-    });
+    // ONLINE MODE (SUPABASE)
+    const { data: expense, error } = await supabase
+      .from('expenses')
+      .insert({
+        title: title.trim(),
+        category: category.trim(),
+        amount: parseFloat(amount),
+        description: description || '',
+        date: date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0],
+        created_by: userId
+      })
+      .select()
+      .single();
+      
+    if (error || !expense) {
+      throw error || new Error('Failed to create expense');
+    }
     
     res.status(201).json({
-      id: expense._id,
+      id: expense.id,
       title: expense.title,
       category: expense.category,
-      amount: expense.amount,
+      amount: parseFloat(expense.amount),
       description: expense.description,
       date: expense.date,
-      created_by: expense.createdBy
+      created_by: expense.created_by
     });
   } catch (error) {
     console.error('Create expense error:', error);
@@ -112,7 +125,7 @@ router.put('/:id', authenticateJWT, restrictTo('manager'), async (req, res) => {
   const { title, category, amount, description, date } = req.body;
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -138,28 +151,44 @@ router.put('/:id', authenticateJWT, restrictTo('manager'), async (req, res) => {
       });
     }
 
-    // ONLINE MODE
-    const expense = await Expense.findById(id);
-    if (!expense) {
+    // ONLINE MODE (SUPABASE)
+    const { data: originalExpense, error } = await supabase
+      .from('expenses')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error || !originalExpense) {
       return res.status(404).json({ error: 'Expense record not found' });
     }
     
-    expense.title = title ? title.trim() : expense.title;
-    expense.category = category ? category.trim() : expense.category;
-    expense.amount = amount !== undefined ? Number(amount) : expense.amount;
-    expense.description = description !== undefined ? description : expense.description;
-    expense.date = date ? new Date(date) : expense.date;
-    
-    await expense.save();
+    const nextTitle = title ? title.trim() : originalExpense.title;
+    const nextCategory = category ? category.trim() : originalExpense.category;
+    const nextAmount = amount !== undefined ? parseFloat(amount) : originalExpense.amount;
+    const nextDescription = description !== undefined ? description : originalExpense.description;
+    const nextDate = date ? new Date(date).toISOString().split('T')[0] : originalExpense.date;
+
+    const { error: updErr } = await supabase
+      .from('expenses')
+      .update({
+        title: nextTitle,
+        category: nextCategory,
+        amount: nextAmount,
+        description: nextDescription,
+        date: nextDate
+      })
+      .eq('id', id);
+
+    if (updErr) throw updErr;
     
     res.json({
-      id: expense._id,
-      title: expense.title,
-      category: expense.category,
-      amount: expense.amount,
-      description: expense.description,
-      date: expense.date,
-      created_by: expense.createdBy
+      id: originalExpense.id,
+      title: nextTitle,
+      category: nextCategory,
+      amount: nextAmount,
+      description: nextDescription,
+      date: nextDate,
+      created_by: originalExpense.created_by
     });
   } catch (error) {
     console.error('Update expense error:', error);
@@ -172,7 +201,7 @@ router.delete('/:id', authenticateJWT, restrictTo('manager'), async (req, res) =
   const { id } = req.params;
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -184,12 +213,18 @@ router.delete('/:id', authenticateJWT, restrictTo('manager'), async (req, res) =
       return res.json({ success: true, message: 'Expense record deleted successfully' });
     }
 
-    // ONLINE MODE
-    const expense = await Expense.findById(id);
-    if (!expense) {
+    // ONLINE MODE (SUPABASE)
+    const { data: expense, error } = await supabase
+      .from('expenses')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error || !expense) {
       return res.status(404).json({ error: 'Expense record not found' });
     }
-    await Expense.findByIdAndDelete(id);
+    
+    await supabase.from('expenses').delete().eq('id', id);
     res.json({ success: true, message: 'Expense record deleted successfully' });
   } catch (error) {
     console.error('Delete expense error:', error);

@@ -1,16 +1,13 @@
 const express = require('express');
 const router = express.Router();
-const mongoose = require('mongoose');
-const Order = require('../models/Order');
-const Product = require('../models/Product');
-const Customer = require('../models/Customer');
+const { supabase } = require('../config/db');
 const mockDb = require('../utils/mockDb');
 const { authenticateJWT, restrictTo } = require('../middleware/auth');
 
 // 1. Sales reports dashboard aggregates
 router.get('/sales-reports', authenticateJWT, restrictTo('manager'), async (req, res) => {
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -62,27 +59,36 @@ router.get('/sales-reports', authenticateJWT, restrictTo('manager'), async (req,
       });
     }
 
-    // ONLINE MODE
-    const orders = await Order.find().populate('items.productId');
+    // ONLINE MODE (SUPABASE)
+    const { data: orders, error: oErr } = await supabase
+      .from('orders')
+      .select('*');
+    if (oErr) throw oErr;
+    
+    const { data: orderItems, error: itemsErr } = await supabase
+      .from('order_items')
+      .select('*, products(category)');
+    if (itemsErr) throw itemsErr;
     
     const dailyMap = {};
     const categoryMap = {};
     let totalRevenue = 0;
     
-    for (const order of orders) {
+    for (const order of orders || []) {
       if (order.status === 'completed' || order.status === 'processing') {
-        const dateStr = order.createdAt.toISOString().split('T')[0];
-        dailyMap[dateStr] = (dailyMap[dateStr] || 0) + order.finalAmount;
+        const dateStr = new Date(order.created_at).toISOString().split('T')[0];
+        dailyMap[dateStr] = (dailyMap[dateStr] || 0) + parseFloat(order.final_amount);
         
-        totalRevenue += order.finalAmount;
+        totalRevenue += parseFloat(order.final_amount);
         
-        for (const item of order.items) {
-          const category = item.productId?.category || 'General';
+        const items = (orderItems || []).filter(it => it.order_id === order.id);
+        for (const item of items) {
+          const category = item.products?.category || 'General';
           if (!categoryMap[category]) {
             categoryMap[category] = { items_sold: 0, category_revenue: 0 };
           }
           categoryMap[category].items_sold += item.quantity;
-          categoryMap[category].category_revenue += item.subtotal;
+          categoryMap[category].category_revenue += parseFloat(item.subtotal);
         }
       }
     }
@@ -91,7 +97,7 @@ router.get('/sales-reports', authenticateJWT, restrictTo('manager'), async (req,
     const dailySales = sortedDates.map(date => ({
       date,
       revenue: dailyMap[date],
-      orders_count: orders.filter(o => o.createdAt.toISOString().split('T')[0] === date).length
+      orders_count: (orders || []).filter(o => new Date(o.created_at).toISOString().split('T')[0] === date).length
     }));
     
     const categorySales = Object.keys(categoryMap).map(cat => ({
@@ -105,8 +111,8 @@ router.get('/sales-reports', authenticateJWT, restrictTo('manager'), async (req,
       categorySales,
       stats: {
         totalRevenue: parseFloat(totalRevenue.toFixed(2)),
-        totalOrders: orders.length,
-        avgOrderValue: orders.length > 0 ? parseFloat((totalRevenue / orders.length).toFixed(2)) : 0
+        totalOrders: (orders || []).length,
+        avgOrderValue: (orders || []).length > 0 ? parseFloat((totalRevenue / (orders || []).length).toFixed(2)) : 0
       }
     });
   } catch (error) {
@@ -118,7 +124,7 @@ router.get('/sales-reports', authenticateJWT, restrictTo('manager'), async (req,
 // 2. AI Demand Prediction & Sales Forecasting
 router.get('/demand-forecast', authenticateJWT, restrictTo('manager'), async (req, res) => {
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     let sortedDates = [];
     const dailyMap = {};
@@ -132,11 +138,11 @@ router.get('/demand-forecast', authenticateJWT, restrictTo('manager'), async (re
         }
       }
     } else {
-      const orders = await Order.find();
-      for (const order of orders) {
+      const { data: orders } = await supabase.from('orders').select('*');
+      for (const order of orders || []) {
         if (order.status === 'completed' || order.status === 'processing') {
-          const dateStr = order.createdAt.toISOString().split('T')[0];
-          dailyMap[dateStr] = (dailyMap[dateStr] || 0) + order.finalAmount;
+          const dateStr = new Date(order.created_at).toISOString().split('T')[0];
+          dailyMap[dateStr] = (dailyMap[dateStr] || 0) + parseFloat(order.final_amount);
         }
       }
     }
@@ -207,7 +213,7 @@ router.get('/demand-forecast', authenticateJWT, restrictTo('manager'), async (re
 // 3. AI Restocking Recommendations
 router.get('/restocking-recommendations', authenticateJWT, restrictTo('manager', 'inventory'), async (req, res) => {
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     const pastSevenDays = new Date();
     pastSevenDays.setDate(pastSevenDays.getDate() - 7);
     
@@ -226,18 +232,27 @@ router.get('/restocking-recommendations', authenticateJWT, restrictTo('manager',
         }
       }
     } else {
-      productsList = await Product.find();
-      const orders = await Order.find({ createdAt: { $gte: pastSevenDays } });
-      for (const order of orders) {
-        for (const item of order.items) {
-          const pIdStr = String(item.productId);
-          velocityMap[pIdStr] = (velocityMap[pIdStr] || 0) + item.quantity;
-        }
+      const { data: products } = await supabase.from('products').select('*');
+      productsList = products || [];
+      
+      const { data: orders } = await supabase
+        .from('orders')
+        .select('id, created_at')
+        .gte('created_at', pastSevenDays.toISOString());
+        
+      const { data: orderItems } = await supabase
+        .from('order_items')
+        .select('product_id, quantity')
+        .in('order_id', (orders || []).map(o => o.id));
+
+      for (const item of orderItems || []) {
+        const pIdStr = String(item.product_id);
+        velocityMap[pIdStr] = (velocityMap[pIdStr] || 0) + item.quantity;
       }
     }
     
     const recommendations = productsList.map(prod => {
-      const prodIdStr = String(prod._id);
+      const prodIdStr = String(prod.id || prod._id);
       const totalSold = velocityMap[prodIdStr] || 0;
       const dailyVelocity = totalSold / 7.0 || 0.15;
       
@@ -245,13 +260,13 @@ router.get('/restocking-recommendations', authenticateJWT, restrictTo('manager',
       const safetyStock = 5;
       
       const rop = Math.ceil((dailyVelocity * supplierLeadTime) + safetyStock);
-      const threshold = isOffline ? prod.lowStockThreshold : prod.lowStockThreshold;
+      const threshold = prod.low_stock_threshold || prod.lowStockThreshold || 10;
       const status = prod.quantity <= rop ? 'Restock Immediately' : 'Healthy Stock';
       
       const suggestedReorder = status === 'Restock Immediately' ? Math.max(20, Math.ceil(dailyVelocity * 30)) : 0;
       
       return {
-        id: prod._id,
+        id: prod.id || prod._id,
         name: prod.name,
         currentQuantity: prod.quantity,
         unit: prod.unit,
@@ -259,7 +274,7 @@ router.get('/restocking-recommendations', authenticateJWT, restrictTo('manager',
         reorderPoint: rop,
         status,
         suggestedReorder,
-        estimatedCost: parseFloat((suggestedReorder * prod.price * 0.85).toFixed(2))
+        estimatedCost: parseFloat((suggestedReorder * parseFloat(prod.price) * 0.85).toFixed(2))
       };
     });
     
@@ -273,7 +288,7 @@ router.get('/restocking-recommendations', authenticateJWT, restrictTo('manager',
 // 4. Customer loyalty & market basket co-occurrence analysis
 router.get('/customer-analysis', authenticateJWT, restrictTo('manager'), async (req, res) => {
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     let ordersList = [];
     let customersList = [];
@@ -323,25 +338,29 @@ router.get('/customer-analysis', authenticateJWT, restrictTo('manager'), async (
         }
       }
     } else {
-      ordersList = await Order.find().populate('items.productId');
-      const customers = await Customer.find().populate('userId', 'name');
-      customersList = customers.map(c => ({
-        _id: c._id,
-        name: c.userId?.name || 'Customer User',
-        loyaltyPoints: c.loyaltyPoints,
+      const { data: orders } = await supabase.from('orders').select('*');
+      ordersList = orders || [];
+      const { data: orderItems } = await supabase.from('order_items').select('*, products(name)');
+      const { data: customers } = await supabase.from('customers').select('*, users(name)');
+      
+      customersList = (customers || []).map(c => ({
+        id: c.id,
+        name: c.users ? c.users.name : 'Customer User',
+        loyaltyPoints: c.loyalty_points,
         tier: c.tier
       }));
       
       for (const order of ordersList) {
         if (order.status === 'completed' || order.status === 'processing') {
-          if (order.customerId) {
-            const cIdStr = String(order.customerId);
-            spendMap[cIdStr] = (spendMap[cIdStr] || 0) + order.finalAmount;
+          if (order.customer_id) {
+            const cIdStr = String(order.customer_id);
+            spendMap[cIdStr] = (spendMap[cIdStr] || 0) + parseFloat(order.final_amount);
           }
           
-          const prodIds = order.items
-            .map(item => ({ id: String(item.productId?._id), name: item.productId?.name }))
-            .filter(p => p.id && p.name);
+          const items = (orderItems || []).filter(it => it.order_id === order.id);
+          const prodIds = items
+            .map(item => ({ id: String(item.product_id), name: item.products ? item.products.name : 'N/A' }))
+            .filter(p => p.id && p.name && p.name !== 'N/A');
             
           for (let i = 0; i < prodIds.length; i++) {
             for (let j = i + 1; j < prodIds.length; j++) {
@@ -372,10 +391,10 @@ router.get('/customer-analysis', authenticateJWT, restrictTo('manager'), async (
       }));
       
     const topLoyalCustomers = customersList.map(cust => {
-      const cIdStr = String(cust._id);
+      const cIdStr = String(cust.id || cust._id);
       return {
         name: cust.name,
-        loyalty_points: cust.loyaltyPoints,
+        loyalty_points: cust.loyaltyPoints || cust.loyalty_points,
         tier: cust.tier,
         total_spent: parseFloat((spendMap[cIdStr] || 0).toFixed(2))
       };

@@ -2,10 +2,7 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const mongoose = require('mongoose');
-const User = require('../models/User');
-const Customer = require('../models/Customer');
-const Employee = require('../models/Employee');
+const { supabase } = require('../config/db');
 const mockDb = require('../utils/mockDb');
 const { authenticateJWT, JWT_SECRET } = require('../middleware/auth');
 
@@ -21,7 +18,7 @@ router.post('/login', async (req, res) => {
   }
 
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -36,26 +33,21 @@ router.post('/login', async (req, res) => {
       if (!isMatch) {
         return res.status(401).json({ error: 'Invalid username or password' });
       }
-      
+
       const token = jwt.sign(
         { id: user._id, username: user.username, role: user.role, name: user.name },
         JWT_SECRET,
         { expiresIn: '24h' }
       );
-      
+
       let details = {};
-      if (user.role === 'customer') {
-        const customer = mockDb.mockCustomers.find(c => String(c.userId) === String(user._id));
-        if (customer) {
-          details = { loyaltyPoints: customer.loyaltyPoints, phone: customer.phone, tier: customer.tier };
-        }
-      } else if (['cashier', 'inventory'].includes(user.role)) {
+      if (['cashier', 'inventory'].includes(user.role)) {
         const employee = mockDb.mockEmployees.find(e => String(e.userId) === String(user._id));
         if (employee) {
           details = { shift: employee.shift, salary: employee.salary };
         }
       }
-      
+
       return res.json({
         token,
         user: {
@@ -69,43 +61,48 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    const user = await User.findOne({ 
-      $or: [{ username: username.trim() }, { email: username.trim() }] 
-    });
-    if (!user) {
+    // ONLINE MODE (SUPABASE)
+    const { data: user, error: userErr } = await supabase
+      .from('users')
+      .select('*')
+      .or(`username.eq.${username.trim()},email.eq.${username.trim()}`)
+      .maybeSingle();
+
+    if (userErr || !user) {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
+
     if (user.role === 'customer') {
       return res.status(403).json({ error: 'Customer portal is disabled.' });
     }
-    const isMatch = await bcrypt.compare(password, user.passwordHash);
+
+    const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
-    
+
     const token = jwt.sign(
-      { id: user._id, username: user.username, role: user.role, name: user.name },
+      { id: user.id, username: user.username, role: user.role, name: user.name },
       JWT_SECRET,
       { expiresIn: '24h' }
     );
-    
+
     let details = {};
-    if (user.role === 'customer') {
-      const customer = await Customer.findOne({ userId: user._id });
-      if (customer) {
-        details = { loyaltyPoints: customer.loyaltyPoints, phone: customer.phone, tier: customer.tier };
-      }
-    } else if (['cashier', 'inventory'].includes(user.role)) {
-      const employee = await Employee.findOne({ userId: user._id });
+    if (['cashier', 'inventory'].includes(user.role)) {
+      const { data: employee } = await supabase
+        .from('employees')
+        .select('*')
+        .eq('user_id', user.id)
+        .maybeSingle();
       if (employee) {
         details = { shift: employee.shift, salary: employee.salary };
       }
     }
-    
+
     res.json({
       token,
       user: {
-        id: user._id,
+        id: user.id,
         username: user.username,
         role: user.role,
         name: user.name,
@@ -127,14 +124,19 @@ router.post('/send-otp', async (req, res) => {
   }
 
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     let user;
 
     if (isOffline) {
       await mockDb.initMockDatabase();
       user = mockDb.mockUsers.find(u => u.email.toLowerCase() === email.trim().toLowerCase());
     } else {
-      user = await User.findOne({ email: email.trim().toLowerCase() });
+      const { data } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', email.trim().toLowerCase())
+        .maybeSingle();
+      user = data;
     }
 
     if (!user) {
@@ -181,7 +183,7 @@ router.post('/verify-otp', async (req, res) => {
     // OTP is valid, remove it
     otpStore.delete(key);
 
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     let user;
 
     if (isOffline) {
@@ -218,21 +220,31 @@ router.post('/verify-otp', async (req, res) => {
       });
     }
 
-    // ONLINE MODE
-    user = await User.findOne({ email: key });
-    if (!user) {
+    // ONLINE MODE (SUPABASE)
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', key)
+      .maybeSingle();
+
+    user = data;
+    if (error || !user) {
       return res.status(404).json({ error: 'User record not found' });
     }
 
     const token = jwt.sign(
-      { id: user._id, username: user.username, role: user.role, name: user.name },
+      { id: user.id, username: user.username, role: user.role, name: user.name },
       JWT_SECRET,
       { expiresIn: '24h' }
     );
 
     let details = {};
     if (['cashier', 'inventory'].includes(user.role)) {
-      const employee = await Employee.findOne({ userId: user._id });
+      const { data: employee } = await supabase
+        .from('employees')
+        .select('*')
+        .eq('user_id', user.id)
+        .maybeSingle();
       if (employee) {
         details = { shift: employee.shift, salary: employee.salary };
       }
@@ -241,7 +253,7 @@ router.post('/verify-otp', async (req, res) => {
     res.json({
       token,
       user: {
-        id: user._id,
+        id: user.id,
         username: user.username,
         role: user.role,
         name: user.name,
@@ -264,7 +276,7 @@ router.post('/register', async (req, res) => {
   }
   
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -310,42 +322,59 @@ router.post('/register', async (req, res) => {
       return res.status(201).json({ success: true, message: 'User registered successfully', userId: newUserId });
     }
 
-    // ONLINE MODE
-    const existingUser = await User.findOne({ 
-      $or: [{ username: username.trim() }, { email: email.trim() }] 
-    });
+    // ONLINE MODE (SUPABASE)
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('*')
+      .or(`username.eq.${username.trim()},email.eq.${email.trim()}`)
+      .maybeSingle();
+
     if (existingUser) {
       return res.status(400).json({ error: 'Username or email already registered' });
     }
     
     const passwordHash = await bcrypt.hash(password, 10);
     
-    const newUser = await User.create({
-      username: username.trim(),
-      passwordHash,
-      email: email.trim(),
-      role,
-      name
-    });
+    const { data: newUser, error: userErr } = await supabase
+      .from('users')
+      .insert({
+        username: username.trim(),
+        password_hash: passwordHash,
+        email: email.trim(),
+        role,
+        name
+      })
+      .select()
+      .single();
     
-    if (role === 'customer') {
-      await Customer.create({
-        userId: newUser._id,
-        loyaltyPoints: 0,
-        phone: phone || '',
-        address: address || '',
-        tier: 'Silver'
-      });
-    } else if (['cashier', 'inventory', 'manager'].includes(role)) {
-      await Employee.create({
-        userId: newUser._id,
-        salary: parseFloat(salary || 18000),
-        shift: shift || 'morning',
-        status: 'active'
-      });
+    if (userErr || !newUser) {
+      throw userErr || new Error('Failed to create user');
     }
     
-    res.status(201).json({ success: true, message: 'User registered successfully', userId: newUser._id });
+    if (role === 'customer') {
+      const { error: custErr } = await supabase
+        .from('customers')
+        .insert({
+          user_id: newUser.id,
+          loyalty_points: 0,
+          phone: phone || '',
+          address: address || '',
+          tier: 'Silver'
+        });
+      if (custErr) throw custErr;
+    } else if (['cashier', 'inventory', 'manager'].includes(role)) {
+      const { error: empErr } = await supabase
+        .from('employees')
+        .insert({
+          user_id: newUser.id,
+          salary: parseFloat(salary || 18000),
+          shift: shift || 'morning',
+          status: 'active'
+        });
+      if (empErr) throw empErr;
+    }
+    
+    res.status(201).json({ success: true, message: 'User registered successfully', userId: newUser.id });
   } catch (error) {
     console.error('Registration error:', error);
     res.status(500).json({ error: 'Failed to register user' });
@@ -355,7 +384,7 @@ router.post('/register', async (req, res) => {
 // 3. Get Current Profile
 router.get('/me', authenticateJWT, async (req, res) => {
   try {
-    const isOffline = mongoose.connection.readyState !== 1;
+    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -388,32 +417,45 @@ router.get('/me', authenticateJWT, async (req, res) => {
       });
     }
 
-    // ONLINE MODE
-    const user = await User.findById(req.user.id).select('-passwordHash');
-    if (!user) {
+    // ONLINE MODE (SUPABASE)
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', req.user.id)
+      .maybeSingle();
+
+    if (error || !user) {
       return res.status(404).json({ error: 'User not found' });
     }
     
     let details = {};
     if (user.role === 'customer') {
-      const customer = await Customer.findOne({ userId: user._id });
+      const { data: customer } = await supabase
+        .from('customers')
+        .select('*')
+        .eq('user_id', user.id)
+        .maybeSingle();
       if (customer) {
-        details = { loyaltyPoints: customer.loyaltyPoints, phone: customer.phone, address: customer.address, tier: customer.tier };
+        details = { loyaltyPoints: customer.loyalty_points, phone: customer.phone, address: customer.address, tier: customer.tier };
       }
     } else if (['cashier', 'inventory'].includes(user.role)) {
-      const employee = await Employee.findOne({ userId: user._id });
+      const { data: employee } = await supabase
+        .from('employees')
+        .select('*')
+        .eq('user_id', user.id)
+        .maybeSingle();
       if (employee) {
         details = { shift: employee.shift, salary: employee.salary, status: employee.status };
       }
     }
     
     res.json({
-      id: user._id,
+      id: user.id,
       username: user.username,
       email: user.email,
       role: user.role,
       name: user.name,
-      createdAt: user.createdAt,
+      createdAt: user.created_at,
       ...details
     });
   } catch (error) {
