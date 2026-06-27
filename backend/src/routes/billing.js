@@ -14,7 +14,7 @@ router.post('/checkout', authenticateJWT, restrictTo('manager', 'cashier'), asyn
   }
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -152,18 +152,18 @@ router.post('/checkout', authenticateJWT, restrictTo('manager', 'cashier'), asyn
       });
     }
 
-    // ONLINE MODE (SUPABASE)
+    // ONLINE MODE (TURSO)
     let subtotal = 0;
     let totalGst = 0;
     let totalDiscount = 0;
     const processedItems = [];
     
     for (const item of items) {
-      const { data: product } = await supabase
-        .from('products')
-        .select('*')
-        .eq('id', item.productId)
-        .maybeSingle();
+      const prodResult = await supabase.execute({
+        sql: 'SELECT * FROM products WHERE id = ?',
+        args: [item.productId]
+      });
+      const product = prodResult.rows[0];
 
       if (!product) {
         return res.status(404).json({ error: `Product ID ${item.productId} not found` });
@@ -201,11 +201,11 @@ router.post('/checkout', authenticateJWT, restrictTo('manager', 'cashier'), asyn
     let loyaltyDiscount = 0;
     
     if (customerId) {
-      const { data: customerRow } = await supabase
-        .from('customers')
-        .select('*')
-        .eq('id', customerId)
-        .maybeSingle();
+      const custResult = await supabase.execute({
+        sql: 'SELECT * FROM customers WHERE id = ?',
+        args: [customerId]
+      });
+      const customerRow = custResult.rows[0];
 
       if (customerRow) {
         let currentPoints = customerRow.loyalty_points || 0;
@@ -223,90 +223,63 @@ router.post('/checkout', authenticateJWT, restrictTo('manager', 'cashier'), asyn
         if (currentPoints > 500) tier = 'Platinum';
         else if (currentPoints > 200) tier = 'Gold';
         
-        await supabase
-          .from('customers')
-          .update({ loyalty_points: currentPoints, tier })
-          .eq('id', customerId);
+        await supabase.execute({
+          sql: 'UPDATE customers SET loyalty_points = ?, tier = ? WHERE id = ?',
+          args: [currentPoints, tier, customerId]
+        });
       }
     }
     
     for (const item of processedItems) {
       // Deduct stock
-      const { data: prod } = await supabase
-        .from('products')
-        .select('*')
-        .eq('id', item.productId)
-        .maybeSingle();
+      const prodResult = await supabase.execute({
+        sql: 'SELECT * FROM products WHERE id = ?',
+        args: [item.productId]
+      });
+      const prod = prodResult.rows[0];
 
       const newQty = Math.max(0, prod.quantity - item.quantity);
-      await supabase
-        .from('products')
-        .update({ quantity: newQty })
-        .eq('id', item.productId);
+      await supabase.execute({
+        sql: 'UPDATE products SET quantity = ? WHERE id = ?',
+        args: [newQty, item.productId]
+      });
       
       // Log stock log
-      await supabase.from('stock_logs').insert({
-        product_id: item.productId,
-        change_qty: -item.quantity,
-        reason: 'sale',
-        user_id: req.user.id
+      await supabase.execute({
+        sql: 'INSERT INTO stock_logs (product_id, change_qty, reason, user_id) VALUES (?, ?, ?, ?)',
+        args: [item.productId, -item.quantity, 'sale', req.user.id]
       });
       
       if (newQty <= (prod.low_stock_threshold || 10)) {
-        await supabase.from('notifications').insert({
-          title: 'Low Stock Alert',
-          message: `Product "${prod.name}" is low on stock (${newQty} ${prod.unit} remaining)`,
-          type: 'low_stock'
+        await supabase.execute({
+          sql: 'INSERT INTO notifications (title, message, type) VALUES (?, ?, ?)',
+          args: ['Low Stock Alert', `Product "${prod.name}" is low on stock (${newQty} ${prod.unit} remaining)`, 'low_stock']
         });
       }
     }
     
     const totalDiscountApplied = totalDiscount + loyaltyDiscount;
-    const { data: newOrder, error: oErr } = await supabase
-      .from('orders')
-      .insert({
-        customer_id: customerId || null,
-        cashier_id: req.user.id,
-        order_type: 'counter',
-        total_amount: subtotal,
-        discount_amount: totalDiscountApplied,
-        gst_amount: totalGst,
-        final_amount: Math.max(0, finalAmount),
-        status: 'completed',
-        payment_method: paymentMethod,
-        payment_status: 'completed'
-      })
-      .select()
-      .single();
+    const orderResult = await supabase.execute({
+      sql: 'INSERT INTO orders (customer_id, cashier_id, order_type, total_amount, discount_amount, gst_amount, final_amount, status, payment_method, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      args: [customerId || null, req.user.id, 'counter', subtotal, totalDiscountApplied, totalGst, Math.max(0, finalAmount), 'completed', paymentMethod, 'completed']
+    });
+    const newOrderId = Number(orderResult.lastInsertRowid);
 
-    if (oErr || !newOrder) {
-      throw oErr || new Error('Failed to create order');
+    for (const item of processedItems) {
+      await supabase.execute({
+        sql: 'INSERT INTO order_items (order_id, product_id, quantity, price, gst_rate, gst_amount, discount_amount, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        args: [newOrderId, item.productId, item.quantity, item.price, item.gstRate, item.gstAmount, item.discountAmount, item.subtotal]
+      });
     }
-
-    const itemsToInsert = processedItems.map(it => ({
-      order_id: newOrder.id,
-      product_id: it.productId,
-      quantity: it.quantity,
-      price: it.price,
-      gst_rate: it.gstRate,
-      gst_amount: it.gstAmount,
-      discount_amount: it.discountAmount,
-      subtotal: it.subtotal
-    }));
-
-    const { error: itemsErr } = await supabase
-      .from('order_items')
-      .insert(itemsToInsert);
-    if (itemsErr) throw itemsErr;
     
-    const invoiceUrl = `http://localhost:5000/api/billing/invoice/${newOrder.id}`;
+    const invoiceUrl = `http://localhost:5000/api/billing/invoice/${newOrderId}`;
     const qrCodeBase64 = await QRCode.toDataURL(invoiceUrl);
     
     res.status(201).json({
       success: true,
       message: 'Transaction completed successfully',
-      orderId: newOrder.id,
-      invoiceNumber: `SMART-INV-${String(newOrder.id).slice(-6).toUpperCase()}`,
+      orderId: newOrderId,
+      invoiceNumber: `SMART-INV-${String(newOrderId).slice(-6).toUpperCase()}`,
       subtotal,
       gstAmount: totalGst,
       discountAmount: totalDiscountApplied,
@@ -351,7 +324,7 @@ router.post('/verify-payment', authenticateJWT, async (req, res) => {
   }
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -413,30 +386,28 @@ router.post('/verify-payment', authenticateJWT, async (req, res) => {
       return res.json({ success: true, message: 'Online order processed successfully', orderId: newOrderId });
     }
 
-    // ONLINE MODE (SUPABASE)
+    // ONLINE MODE (TURSO)
     const processedItems = [];
     for (const item of items) {
-      const { data: product } = await supabase
-        .from('products')
-        .select('*')
-        .eq('id', item.productId)
-        .maybeSingle();
+      const prodResult = await supabase.execute({
+        sql: 'SELECT * FROM products WHERE id = ?',
+        args: [item.productId]
+      });
+      const product = prodResult.rows[0];
 
       if (!product || product.quantity < item.quantity) {
         return res.status(400).json({ error: `Product "${item.name}" is out of stock or insufficient.` });
       }
       
       const newQty = Math.max(0, product.quantity - item.quantity);
-      await supabase
-        .from('products')
-        .update({ quantity: newQty })
-        .eq('id', item.productId);
+      await supabase.execute({
+        sql: 'UPDATE products SET quantity = ? WHERE id = ?',
+        args: [newQty, item.productId]
+      });
       
-      await supabase.from('stock_logs').insert({
-        product_id: item.productId,
-        change_qty: -item.quantity,
-        reason: 'sale',
-        user_id: req.user.id
+      await supabase.execute({
+        sql: 'INSERT INTO stock_logs (product_id, change_qty, reason, user_id) VALUES (?, ?, ?, ?)',
+        args: [item.productId, -item.quantity, 'sale', req.user.id]
       });
       
       processedItems.push({
@@ -451,60 +422,35 @@ router.post('/verify-payment', authenticateJWT, async (req, res) => {
     }
     
     if (customerId) {
-      const { data: customer } = await supabase
-        .from('customers')
-        .select('*')
-        .eq('id', customerId)
-        .maybeSingle();
+      const custResult = await supabase.execute({
+        sql: 'SELECT * FROM customers WHERE id = ?',
+        args: [customerId]
+      });
+      const customer = custResult.rows[0];
 
       if (customer) {
         const extraPoints = Math.floor(parseFloat(finalAmount) / 100);
-        await supabase
-          .from('customers')
-          .update({ loyalty_points: (customer.loyalty_points || 0) + extraPoints })
-          .eq('id', customerId);
+        await supabase.execute({
+          sql: 'UPDATE customers SET loyalty_points = ? WHERE id = ?',
+          args: [(customer.loyalty_points || 0) + extraPoints, customerId]
+        });
       }
     }
     
-    const { data: newOrder, error: oErr } = await supabase
-      .from('orders')
-      .insert({
-        customer_id: customerId || null,
-        order_type: 'online',
-        total_amount: parseFloat(totalAmount),
-        discount_amount: parseFloat(discountAmount || 0.0),
-        gst_amount: parseFloat(gstAmount || 0.0),
-        final_amount: parseFloat(finalAmount),
-        status: 'processing',
-        payment_method: 'razorpay',
-        payment_status: 'completed',
-        razorpay_order_id: razorpayOrderId || null,
-        razorpay_payment_id: razorpayPaymentId || null
-      })
-      .select()
-      .single();
+    const orderResult = await supabase.execute({
+      sql: 'INSERT INTO orders (customer_id, order_type, total_amount, discount_amount, gst_amount, final_amount, status, payment_method, payment_status, razorpay_order_id, razorpay_payment_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      args: [customerId || null, 'online', parseFloat(totalAmount), parseFloat(discountAmount || 0.0), parseFloat(gstAmount || 0.0), parseFloat(finalAmount), 'processing', 'razorpay', 'completed', razorpayOrderId || null, razorpayPaymentId || null]
+    });
+    const newOrderId = Number(orderResult.lastInsertRowid);
 
-    if (oErr || !newOrder) {
-      throw oErr || new Error('Failed to create online order');
+    for (const it of processedItems) {
+      await supabase.execute({
+        sql: 'INSERT INTO order_items (order_id, product_id, quantity, price, gst_rate, gst_amount, discount_amount, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        args: [newOrderId, it.productId, it.quantity, it.price, it.gstRate, it.gstAmount, it.discountAmount, it.subtotal]
+      });
     }
-
-    const itemsToInsert = processedItems.map(it => ({
-      order_id: newOrder.id,
-      product_id: it.productId,
-      quantity: it.quantity,
-      price: it.price,
-      gst_rate: it.gstRate,
-      gst_amount: it.gstAmount,
-      discount_amount: it.discountAmount,
-      subtotal: it.subtotal
-    }));
-
-    const { error: itemsErr } = await supabase
-      .from('order_items')
-      .insert(itemsToInsert);
-    if (itemsErr) throw itemsErr;
     
-    res.json({ success: true, message: 'Online order processed successfully', orderId: newOrder.id });
+    res.json({ success: true, message: 'Online order processed successfully', orderId: newOrderId });
   } catch (error) {
     console.error('Verify payment error:', error);
     res.status(500).json({ error: 'Failed to verify payment' });
@@ -516,7 +462,7 @@ router.get('/invoice/:orderId', authenticateJWT, async (req, res) => {
   const { orderId } = req.params;
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -574,28 +520,34 @@ router.get('/invoice/:orderId', authenticateJWT, async (req, res) => {
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: order, error: oErr } = await supabase
-      .from('orders')
-      .select('*, customers(phone, users(name))')
-      .eq('id', orderId)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const orderResult = await supabase.execute({
+      sql: `SELECT o.*, c.phone AS customer_phone, u.name AS customer_name 
+            FROM orders o 
+            LEFT JOIN customers c ON o.customer_id = c.id 
+            LEFT JOIN users u ON c.user_id = u.id 
+            WHERE o.id = ?`,
+      args: [orderId]
+    });
+    const order = orderResult.rows[0];
       
-    if (oErr || !order) {
+    if (!order) {
       return res.status(404).json({ error: 'Order / Invoice not found' });
     }
     
-    const { data: orderItems, error: itemsErr } = await supabase
-      .from('order_items')
-      .select('*, products(name, unit)')
-      .eq('order_id', orderId);
-
-    if (itemsErr) throw itemsErr;
+    const itemsResult = await supabase.execute({
+      sql: `SELECT oi.*, p.name, p.unit 
+            FROM order_items oi 
+            LEFT JOIN products p ON oi.product_id = p.id 
+            WHERE oi.order_id = ?`,
+      args: [orderId]
+    });
+    const orderItems = itemsResult.rows;
     
     const formattedItems = orderItems.map(it => ({
       productId: it.product_id,
-      name: it.products ? it.products.name : 'N/A',
-      unit: it.products ? it.products.unit : 'Pieces',
+      name: it.name || 'N/A',
+      unit: it.unit || 'Pieces',
       quantity: it.quantity,
       price: parseFloat(it.price),
       gst_rate: parseFloat(it.gst_rate),
@@ -618,8 +570,8 @@ router.get('/invoice/:orderId', authenticateJWT, async (req, res) => {
         razorpay_order_id: order.razorpay_order_id,
         razorpay_payment_id: order.razorpay_payment_id,
         created_at: order.created_at,
-        customer_phone: order.customers ? order.customers.phone : '',
-        customer_name: order.customers && order.customers.users ? order.customers.users.name : ''
+        customer_phone: order.customer_phone || '',
+        customer_name: order.customer_name || ''
       },
       items: formattedItems
     });

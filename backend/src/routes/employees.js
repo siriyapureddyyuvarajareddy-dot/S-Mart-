@@ -4,230 +4,330 @@ const { supabase } = require('../config/db');
 const mockDb = require('../utils/mockDb');
 const { authenticateJWT, restrictTo } = require('../middleware/auth');
 
-// 1. Get Employees List
+// 1. Get Employees List (Manager Only)
 router.get('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
-      const formatted = mockDb.mockEmployees.map(emp => {
+      const list = mockDb.mockEmployees.map(emp => {
         const userObj = mockDb.mockUsers.find(u => String(u._id) === String(emp.userId));
         return {
           id: emp._id,
-          salary: emp.salary,
-          shift: emp.shift,
-          status: emp.status,
           username: userObj ? userObj.username : 'N/A',
           email: userObj ? userObj.email : 'N/A',
           name: userObj ? userObj.name : 'N/A',
-          role: userObj ? userObj.role : 'N/A'
+          role: userObj ? userObj.role : 'N/A',
+          salary: emp.salary,
+          shift: emp.shift,
+          status: emp.status,
+          created_at: userObj ? userObj.createdAt : new Date()
         };
       });
-      return res.json(formatted);
+      return res.json(list);
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: employees, error } = await supabase
-      .from('employees')
-      .select('*, users(username, email, name, role)');
-      
-    if (error) throw error;
-      
-    const formatted = employees.map(emp => ({
-      id: emp.id,
-      salary: parseFloat(emp.salary),
-      shift: emp.shift,
-      status: emp.status,
-      username: emp.users ? emp.users.username : 'N/A',
-      email: emp.users ? emp.users.email : 'N/A',
-      name: emp.users ? emp.users.name : 'N/A',
-      role: emp.users ? emp.users.role : 'N/A'
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: `SELECT e.*, u.username, u.email, u.name, u.role, u.created_at 
+            FROM employees e 
+            INNER JOIN users u ON e.user_id = u.id`
+    });
+    const employees = result.rows;
+    
+    const formatted = employees.map(e => ({
+      id: e.id,
+      username: e.username,
+      email: e.email,
+      name: e.name,
+      role: e.role,
+      salary: parseFloat(e.salary),
+      shift: e.shift,
+      status: e.status,
+      created_at: e.created_at
     }));
     
     res.json(formatted);
   } catch (error) {
-    console.error('Fetch employees error:', error);
+    console.error('Fetch employees list error:', error);
     res.status(500).json({ error: 'Failed to retrieve employee roster' });
   }
 });
 
-// 2. Clock In
-router.post('/attendance/checkin', authenticateJWT, async (req, res) => {
-  const { employeeId } = req.body;
+// 2. Change Employee Shift Configuration
+router.put('/:id/shift', authenticateJWT, restrictTo('manager'), async (req, res) => {
+  const { id } = req.params;
+  const { shift } = req.body;
   
-  if (!employeeId) {
-    return res.status(400).json({ error: 'Employee ID is required for checking in' });
+  if (!shift || !['morning', 'afternoon', 'night'].includes(shift)) {
+    return res.status(400).json({ error: 'Valid shift schedule (morning, afternoon, night) is required' });
   }
   
-  const today = new Date().toISOString().split('T')[0];
-  const nowTime = new Date().toTimeString().split(' ')[0]; // HH:MM:SS
-  
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
-      const existing = mockDb.mockAttendance.find(a => String(a.employeeId) === String(employeeId) && a.date === today);
-      if (existing) {
-        return res.status(400).json({ error: 'Employee already checked in for today' });
+      const employee = mockDb.mockEmployees.find(e => String(e._id) === String(id));
+      if (!employee) {
+        return res.status(404).json({ error: 'Employee profile not found' });
+      }
+      employee.shift = shift;
+      return res.json({ success: true, message: `Shift scheduled successfully to ${shift}` });
+    }
+
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: 'SELECT * FROM employees WHERE id = ?',
+      args: [id]
+    });
+    const employee = result.rows[0];
+
+    if (!employee) {
+      return res.status(404).json({ error: 'Employee profile not found' });
+    }
+    
+    await supabase.execute({
+      sql: 'UPDATE employees SET shift = ? WHERE id = ?',
+      args: [shift, id]
+    });
+    
+    res.json({ success: true, message: `Shift scheduled successfully to ${shift}` });
+  } catch (error) {
+    console.error('Update shift error:', error);
+    res.status(500).json({ error: 'Failed to reschedule shift' });
+  }
+});
+
+// 3. Daily Attendance Clock-in
+router.post('/clock-in', authenticateJWT, async (req, res) => {
+  try {
+    const isOffline = !process.env.TURSO_DATABASE_URL;
+    const dateToday = new Date().toISOString().split('T')[0];
+    
+    if (isOffline) {
+      await mockDb.initMockDatabase();
+      const employee = mockDb.mockEmployees.find(e => String(e.userId) === String(req.user.id));
+      if (!employee) {
+        return res.status(404).json({ error: 'Employee profile not found' });
       }
       
-      const hour = parseInt(nowTime.split(':')[0], 10);
-      const minute = parseInt(nowTime.split(':')[1], 10);
-      let status = 'present';
-      if (hour > 9 || (hour === 9 && minute > 30)) {
-        status = 'late';
+      const check = mockDb.mockAttendance.find(a => 
+        String(a.employeeId) === String(employee._id) && a.date === dateToday
+      );
+      if (check) {
+        return res.status(400).json({ error: 'Already clocked in today' });
       }
       
-      mockDb.mockAttendance.push({
+      const status = (employee.shift === 'morning' && new Date().getHours() >= 9) ? 'late' : 'present';
+      
+      const attRecord = {
         _id: `mock_att_${mockDb.mockAttendance.length + 1}`,
-        employeeId,
-        date: today,
-        checkIn: nowTime,
+        employeeId: employee._id,
+        date: dateToday,
+        checkIn: new Date().toLocaleTimeString(),
         checkOut: null,
-        status
-      });
+        status,
+        createdAt: new Date()
+      };
       
-      return res.status(201).json({ success: true, message: 'Check-in recorded', time: nowTime, status });
+      mockDb.mockAttendance.push(attRecord);
+      
+      return res.status(201).json({
+        success: true,
+        message: 'Clocked in successfully',
+        record: {
+          id: attRecord._id,
+          date: attRecord.date,
+          check_in: attRecord.checkIn,
+          status: attRecord.status
+        }
+      });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: existing, error: checkErr } = await supabase
-      .from('attendance')
-      .select('*')
-      .eq('employee_id', employeeId)
-      .eq('date', today)
-      .maybeSingle();
-      
-    if (existing) {
-      return res.status(400).json({ error: 'Employee already checked in for today' });
-    }
-    
-    const hour = parseInt(nowTime.split(':')[0], 10);
-    const minute = parseInt(nowTime.split(':')[1], 10);
-    let status = 'present';
-    if (hour > 9 || (hour === 9 && minute > 30)) {
-      status = 'late';
-    }
-    
-    const { error: insErr } = await supabase
-      .from('attendance')
-      .insert({
-        employee_id: employeeId,
-        date: today,
-        check_in: nowTime,
-        status
-      });
+    // ONLINE MODE (TURSO)
+    const empResult = await supabase.execute({
+      sql: 'SELECT * FROM employees WHERE user_id = ?',
+      args: [req.user.id]
+    });
+    const employee = empResult.rows[0];
 
-    if (insErr) throw insErr;
+    if (!employee) {
+      return res.status(404).json({ error: 'Employee profile not found' });
+    }
     
-    res.status(201).json({ success: true, message: 'Check-in recorded', time: nowTime, status });
+    const checkResult = await supabase.execute({
+      sql: 'SELECT * FROM attendance WHERE employee_id = ? AND date = ?',
+      args: [employee.id, dateToday]
+    });
+    if (checkResult.rows.length > 0) {
+      return res.status(400).json({ error: 'Already clocked in today' });
+    }
+    
+    const timeNow = new Date().toLocaleTimeString();
+    const status = (employee.shift === 'morning' && new Date().getHours() >= 9) ? 'late' : 'present';
+    
+    const insertResult = await supabase.execute({
+      sql: 'INSERT INTO attendance (employee_id, date, check_in, status) VALUES (?, ?, ?, ?)',
+      args: [employee.id, dateToday, timeNow, status]
+    });
+    
+    res.status(201).json({
+      success: true,
+      message: 'Clocked in successfully',
+      record: {
+        id: Number(insertResult.lastInsertRowid),
+        date: dateToday,
+        check_in: timeNow,
+        status
+      }
+    });
   } catch (error) {
-    console.error('Attendance check-in error:', error);
-    res.status(500).json({ error: 'Failed to log check-in' });
+    console.error('Clock in error:', error);
+    res.status(500).json({ error: 'Failed to record clock-in attendance' });
   }
 });
 
-// 3. Clock Out
-router.post('/attendance/checkout', authenticateJWT, async (req, res) => {
-  const { employeeId } = req.body;
-  
-  if (!employeeId) {
-    return res.status(400).json({ error: 'Employee ID is required for checking out' });
-  }
-  
-  const today = new Date().toISOString().split('T')[0];
-  const nowTime = new Date().toTimeString().split(' ')[0]; // HH:MM:SS
-  
+// 4. Daily Attendance Clock-out
+router.post('/clock-out', authenticateJWT, async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
+    const dateToday = new Date().toISOString().split('T')[0];
     
     if (isOffline) {
       await mockDb.initMockDatabase();
-      const record = mockDb.mockAttendance.find(a => String(a.employeeId) === String(employeeId) && a.date === today);
-      if (!record) {
-        return res.status(400).json({ error: 'No check-in record found for today.' });
+      const employee = mockDb.mockEmployees.find(e => String(e.userId) === String(req.user.id));
+      if (!employee) {
+        return res.status(404).json({ error: 'Employee profile not found' });
       }
       
-      record.checkOut = nowTime;
-      return res.json({ success: true, message: 'Check-out recorded', time: nowTime });
-    }
-
-    // ONLINE MODE (SUPABASE)
-    const { data: record, error } = await supabase
-      .from('attendance')
-      .select('*')
-      .eq('employee_id', employeeId)
-      .eq('date', today)
-      .maybeSingle();
-
-    if (error || !record) {
-      return res.status(400).json({ error: 'No check-in record found for today. Please check in first.' });
-    }
-    
-    const { error: updErr } = await supabase
-      .from('attendance')
-      .update({ check_out: nowTime })
-      .eq('id', record.id);
+      const check = mockDb.mockAttendance.find(a => 
+        String(a.employeeId) === String(employee._id) && a.date === dateToday
+      );
+      if (!check) {
+        return res.status(400).json({ error: 'Must clock-in first before clocking-out' });
+      }
+      if (check.checkOut) {
+        return res.status(400).json({ error: 'Already clocked out today' });
+      }
       
-    if (updErr) throw updErr;
+      check.checkOut = new Date().toLocaleTimeString();
+      return res.json({
+        success: true,
+        message: 'Clocked out successfully',
+        record: {
+          id: check._id,
+          date: check.date,
+          check_in: check.checkIn,
+          check_out: check.checkOut,
+          status: check.status
+        }
+      });
+    }
+
+    // ONLINE MODE (TURSO)
+    const empResult = await supabase.execute({
+      sql: 'SELECT * FROM employees WHERE user_id = ?',
+      args: [req.user.id]
+    });
+    const employee = empResult.rows[0];
+
+    if (!employee) {
+      return res.status(404).json({ error: 'Employee profile not found' });
+    }
     
-    res.json({ success: true, message: 'Check-out recorded', time: nowTime });
+    const checkResult = await supabase.execute({
+      sql: 'SELECT * FROM attendance WHERE employee_id = ? AND date = ?',
+      args: [employee.id, dateToday]
+    });
+    const record = checkResult.rows[0];
+
+    if (!record) {
+      return res.status(400).json({ error: 'Must clock-in first before clocking-out' });
+    }
+    if (record.check_out) {
+      return res.status(400).json({ error: 'Already clocked out today' });
+    }
+    
+    const timeNow = new Date().toLocaleTimeString();
+    await supabase.execute({
+      sql: 'UPDATE attendance SET check_out = ? WHERE id = ?',
+      args: [timeNow, record.id]
+    });
+    
+    res.json({
+      success: true,
+      message: 'Clocked out successfully',
+      record: {
+        id: record.id,
+        date: record.date,
+        check_in: record.check_in,
+        check_out: timeNow,
+        status: record.status
+      }
+    });
   } catch (error) {
-    console.error('Attendance check-out error:', error);
-    res.status(500).json({ error: 'Failed to log check-out' });
+    console.error('Clock out error:', error);
+    res.status(500).json({ error: 'Failed to record clock-out attendance' });
   }
 });
 
-// 4. Retrieve Attendance Log report
-router.get('/attendance/report', authenticateJWT, restrictTo('manager'), async (req, res) => {
+// 5. Get Logged Attendance History (30 days)
+router.get('/attendance-logs', authenticateJWT, async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
-      const formatted = mockDb.mockAttendance.map(att => {
-        const emp = mockDb.mockEmployees.find(e => String(e._id) === String(att.employeeId));
-        const userObj = emp ? mockDb.mockUsers.find(u => String(u._id) === String(emp.userId)) : null;
-        return {
-          id: att._id,
-          employeeId: att.employeeId,
-          date: att.date,
-          check_in: att.checkIn,
-          check_out: att.checkOut,
-          status: att.status,
-          name: userObj ? userObj.name : 'N/A',
-          role: userObj ? userObj.role : 'N/A',
-          shift: emp ? emp.shift : 'morning'
-        };
-      });
-      return res.json(formatted);
+      const employee = mockDb.mockEmployees.find(e => String(e.userId) === String(req.user.id));
+      if (!employee) {
+        return res.status(404).json({ error: 'Employee profile not found' });
+      }
+      
+      const list = mockDb.mockAttendance
+        .filter(a => String(a.employeeId) === String(employee._id))
+        .sort((a, b) => new Date(b.date) - new Date(a.date))
+        .slice(0, 30)
+        .map(a => ({
+          id: a._id,
+          date: a.date,
+          check_in: a.checkIn,
+          check_out: a.checkOut,
+          status: a.status
+        }));
+        
+      return res.json(list);
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: report, error } = await supabase
-      .from('attendance')
-      .select('*, employees(*, users(name, role))')
-      .order('date', { ascending: false });
-      
-    if (error) throw error;
-      
-    const formatted = report.map(att => ({
-      id: att.id,
-      employeeId: att.employee_id,
-      date: att.date,
-      check_in: att.check_in,
-      check_out: att.check_out,
-      status: att.status,
-      name: att.employees && att.employees.users ? att.employees.users.name : 'N/A',
-      role: att.employees && att.employees.users ? att.employees.users.role : 'N/A',
-      shift: att.employees ? att.employees.shift : 'morning'
+    // ONLINE MODE (TURSO)
+    const empResult = await supabase.execute({
+      sql: 'SELECT * FROM employees WHERE user_id = ?',
+      args: [req.user.id]
+    });
+    const employee = empResult.rows[0];
+
+    if (!employee) {
+      return res.status(404).json({ error: 'Employee profile not found' });
+    }
+    
+    const attResult = await supabase.execute({
+      sql: 'SELECT * FROM attendance WHERE employee_id = ? ORDER BY date DESC LIMIT 30',
+      args: [employee.id]
+    });
+    const logs = attResult.rows;
+    
+    const formatted = logs.map(l => ({
+      id: l.id,
+      date: l.date,
+      check_in: l.check_in,
+      check_out: l.check_out,
+      status: l.status
     }));
     
     res.json(formatted);
   } catch (error) {
-    console.error('Fetch attendance report error:', error);
+    console.error('Fetch attendance logs error:', error);
     res.status(500).json({ error: 'Failed to retrieve attendance logs' });
   }
 });

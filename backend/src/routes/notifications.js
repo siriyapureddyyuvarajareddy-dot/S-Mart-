@@ -7,7 +7,7 @@ const { authenticateJWT } = require('../middleware/auth');
 // 1. Fetch Notifications
 router.get('/', authenticateJWT, async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -36,14 +36,11 @@ router.get('/', authenticateJWT, async (req, res) => {
       return res.json(formatted);
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: notifications, error } = await supabase
-      .from('notifications')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(50);
-      
-    if (error) throw error;
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: 'SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50'
+    });
+    const notifications = result.rows;
     
     const formatted = notifications.map(n => ({
       id: n.id,
@@ -67,7 +64,7 @@ router.get('/', authenticateJWT, async (req, res) => {
 router.put('/:id/read', authenticateJWT, async (req, res) => {
   const { id } = req.params;
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -80,23 +77,21 @@ router.put('/:id/read', authenticateJWT, async (req, res) => {
       return res.json({ success: true, message: 'Notification marked as read' });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: notification, error } = await supabase
-      .from('notifications')
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: 'SELECT * FROM notifications WHERE id = ?',
+      args: [id]
+    });
+    const notification = result.rows[0];
 
-    if (error || !notification) {
+    if (!notification) {
       return res.status(404).json({ error: 'Notification not found' });
     }
     
-    const { error: updErr } = await supabase
-      .from('notifications')
-      .update({ status: 'read' })
-      .eq('id', id);
-
-    if (updErr) throw updErr;
+    await supabase.execute({
+      sql: 'UPDATE notifications SET status = ? WHERE id = ?',
+      args: ['read', id]
+    });
     
     res.json({ success: true, message: 'Notification marked as read' });
   } catch (error) {

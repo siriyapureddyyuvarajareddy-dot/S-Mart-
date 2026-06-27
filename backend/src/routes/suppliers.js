@@ -7,7 +7,7 @@ const { authenticateJWT, restrictTo } = require('../middleware/auth');
 // 1. Get Suppliers
 router.get('/', authenticateJWT, restrictTo('manager', 'inventory'), async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -24,13 +24,11 @@ router.get('/', authenticateJWT, restrictTo('manager', 'inventory'), async (req,
       return res.json(formatted);
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: suppliers, error } = await supabase
-      .from('suppliers')
-      .select('*')
-      .order('created_at', { ascending: false });
-      
-    if (error) throw error;
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: 'SELECT * FROM suppliers ORDER BY created_at DESC'
+    });
+    const suppliers = result.rows;
     
     const formatted = suppliers.map(s => ({
       id: s.id,
@@ -58,7 +56,7 @@ router.post('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
   }
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -91,42 +89,29 @@ router.post('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: duplicate } = await supabase
-      .from('suppliers')
-      .select('*')
-      .eq('name', name.trim())
-      .maybeSingle();
-
-    if (duplicate) {
+    // ONLINE MODE (TURSO)
+    const dupResult = await supabase.execute({
+      sql: 'SELECT * FROM suppliers WHERE name = ?',
+      args: [name.trim()]
+    });
+    if (dupResult.rows.length > 0) {
       return res.status(400).json({ error: 'Supplier name already exists' });
     }
 
-    const { data: supplier, error } = await supabase
-      .from('suppliers')
-      .insert({
-        name: name.trim(),
-        contact_person: contactPerson || '',
-        phone: phone || '',
-        email: email || '',
-        address: address || '',
-        gstin: gstin || ''
-      })
-      .select()
-      .single();
-      
-    if (error || !supplier) {
-      throw error || new Error('Failed to register supplier');
-    }
+    const insertResult = await supabase.execute({
+      sql: 'INSERT INTO suppliers (name, contact_person, phone, email, address, gstin) VALUES (?, ?, ?, ?, ?, ?)',
+      args: [name.trim(), contactPerson || '', phone || '', email || '', address || '', gstin || '']
+    });
+    const newId = Number(insertResult.lastInsertRowid);
     
     res.status(201).json({
-      id: supplier.id,
-      name: supplier.name,
-      contact_person: supplier.contact_person,
-      phone: supplier.phone,
-      email: supplier.email,
-      address: supplier.address,
-      gstin: supplier.gstin
+      id: newId,
+      name: name.trim(),
+      contact_person: contactPerson || '',
+      phone: phone || '',
+      email: email || '',
+      address: address || '',
+      gstin: gstin || ''
     });
   } catch (error) {
     console.error('Create supplier error:', error);
@@ -140,7 +125,7 @@ router.put('/:id', authenticateJWT, restrictTo('manager'), async (req, res) => {
   const { name, contactPerson, phone, email, address, gstin } = req.body;
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -167,14 +152,14 @@ router.put('/:id', authenticateJWT, restrictTo('manager'), async (req, res) => {
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: originalSupplier, error } = await supabase
-      .from('suppliers')
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: 'SELECT * FROM suppliers WHERE id = ?',
+      args: [id]
+    });
+    const originalSupplier = result.rows[0];
 
-    if (error || !originalSupplier) {
+    if (!originalSupplier) {
       return res.status(404).json({ error: 'Supplier not found' });
     }
     
@@ -185,19 +170,10 @@ router.put('/:id', authenticateJWT, restrictTo('manager'), async (req, res) => {
     const nextAddress = address !== undefined ? address : originalSupplier.address;
     const nextGstin = gstin !== undefined ? gstin : originalSupplier.gstin;
 
-    const { error: updErr } = await supabase
-      .from('suppliers')
-      .update({
-        name: nextName,
-        contact_person: nextPerson,
-        phone: nextPhone,
-        email: nextEmail,
-        address: nextAddress,
-        gstin: nextGstin
-      })
-      .eq('id', id);
-
-    if (updErr) throw updErr;
+    await supabase.execute({
+      sql: 'UPDATE suppliers SET name = ?, contact_person = ?, phone = ?, email = ?, address = ?, gstin = ? WHERE id = ?',
+      args: [nextName, nextPerson, nextPhone, nextEmail, nextAddress, nextGstin, id]
+    });
     
     res.json({
       id: originalSupplier.id,
@@ -219,7 +195,7 @@ router.delete('/:id', authenticateJWT, restrictTo('manager'), async (req, res) =
   const { id } = req.params;
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -231,18 +207,21 @@ router.delete('/:id', authenticateJWT, restrictTo('manager'), async (req, res) =
       return res.json({ success: true, message: 'Supplier deleted successfully' });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: supplier, error } = await supabase
-      .from('suppliers')
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: 'SELECT * FROM suppliers WHERE id = ?',
+      args: [id]
+    });
+    const supplier = result.rows[0];
 
-    if (error || !supplier) {
+    if (!supplier) {
       return res.status(404).json({ error: 'Supplier not found' });
     }
     
-    await supabase.from('suppliers').delete().eq('id', id);
+    await supabase.execute({
+      sql: 'DELETE FROM suppliers WHERE id = ?',
+      args: [id]
+    });
     res.json({ success: true, message: 'Supplier deleted successfully' });
   } catch (error) {
     console.error('Delete supplier error:', error);

@@ -59,11 +59,11 @@ async function startServer() {
       console.log('[Test Mode] Server bootstrap check completed successfully.');
       if (dbConnected) {
         const { supabase } = require('./config/db');
-        const { data: user, error } = await supabase
-          .from('users')
-          .select('*')
-          .eq('username', 'manager')
-          .single();
+        const userResult = await supabase.execute({
+          sql: 'SELECT * FROM users WHERE username = ?',
+          args: ['manager']
+        });
+        const user = userResult.rows[0];
         if (user && user.name === 'Manager User') {
           console.log('[Test Mode] Database seed verification passed.');
           process.exit(0);

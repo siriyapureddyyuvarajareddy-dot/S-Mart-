@@ -7,7 +7,7 @@ const { authenticateJWT, restrictTo } = require('../middleware/auth');
 // 1. Sales reports dashboard aggregates
 router.get('/sales-reports', authenticateJWT, restrictTo('manager'), async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -59,16 +59,16 @@ router.get('/sales-reports', authenticateJWT, restrictTo('manager'), async (req,
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: orders, error: oErr } = await supabase
-      .from('orders')
-      .select('*');
-    if (oErr) throw oErr;
+    // ONLINE MODE (TURSO)
+    const ordersRes = await supabase.execute('SELECT * FROM orders');
+    const orders = ordersRes.rows;
     
-    const { data: orderItems, error: itemsErr } = await supabase
-      .from('order_items')
-      .select('*, products(category)');
-    if (itemsErr) throw itemsErr;
+    const itemsRes = await supabase.execute(`
+      SELECT oi.*, p.category 
+      FROM order_items oi 
+      LEFT JOIN products p ON oi.product_id = p.id
+    `);
+    const orderItems = itemsRes.rows;
     
     const dailyMap = {};
     const categoryMap = {};
@@ -83,7 +83,7 @@ router.get('/sales-reports', authenticateJWT, restrictTo('manager'), async (req,
         
         const items = (orderItems || []).filter(it => it.order_id === order.id);
         for (const item of items) {
-          const category = item.products?.category || 'General';
+          const category = item.category || 'General';
           if (!categoryMap[category]) {
             categoryMap[category] = { items_sold: 0, category_revenue: 0 };
           }
@@ -124,7 +124,7 @@ router.get('/sales-reports', authenticateJWT, restrictTo('manager'), async (req,
 // 2. AI Demand Prediction & Sales Forecasting
 router.get('/demand-forecast', authenticateJWT, restrictTo('manager'), async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     let sortedDates = [];
     const dailyMap = {};
@@ -138,7 +138,8 @@ router.get('/demand-forecast', authenticateJWT, restrictTo('manager'), async (re
         }
       }
     } else {
-      const { data: orders } = await supabase.from('orders').select('*');
+      const ordersRes = await supabase.execute('SELECT * FROM orders');
+      const orders = ordersRes.rows;
       for (const order of orders || []) {
         if (order.status === 'completed' || order.status === 'processing') {
           const dateStr = new Date(order.created_at).toISOString().split('T')[0];
@@ -213,7 +214,7 @@ router.get('/demand-forecast', authenticateJWT, restrictTo('manager'), async (re
 // 3. AI Restocking Recommendations
 router.get('/restocking-recommendations', authenticateJWT, restrictTo('manager', 'inventory'), async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     const pastSevenDays = new Date();
     pastSevenDays.setDate(pastSevenDays.getDate() - 7);
     
@@ -232,22 +233,29 @@ router.get('/restocking-recommendations', authenticateJWT, restrictTo('manager',
         }
       }
     } else {
-      const { data: products } = await supabase.from('products').select('*');
-      productsList = products || [];
+      const productsRes = await supabase.execute('SELECT * FROM products');
+      productsList = productsRes.rows || [];
       
-      const { data: orders } = await supabase
-        .from('orders')
-        .select('id, created_at')
-        .gte('created_at', pastSevenDays.toISOString());
+      const ordersRes = await supabase.execute({
+        sql: 'SELECT id, created_at FROM orders WHERE created_at >= ?',
+        args: [pastSevenDays.toISOString()]
+      });
+      const orders = ordersRes.rows;
+      
+      if (orders && orders.length > 0) {
+        const orderIds = orders.map(o => o.id);
+        const placeholders = orderIds.map(() => '?').join(',');
         
-      const { data: orderItems } = await supabase
-        .from('order_items')
-        .select('product_id, quantity')
-        .in('order_id', (orders || []).map(o => o.id));
+        const itemsRes = await supabase.execute({
+          sql: `SELECT product_id, quantity FROM order_items WHERE order_id IN (${placeholders})`,
+          args: orderIds
+        });
+        const orderItems = itemsRes.rows;
 
-      for (const item of orderItems || []) {
-        const pIdStr = String(item.product_id);
-        velocityMap[pIdStr] = (velocityMap[pIdStr] || 0) + item.quantity;
+        for (const item of orderItems || []) {
+          const pIdStr = String(item.product_id);
+          velocityMap[pIdStr] = (velocityMap[pIdStr] || 0) + item.quantity;
+        }
       }
     }
     
@@ -260,7 +268,6 @@ router.get('/restocking-recommendations', authenticateJWT, restrictTo('manager',
       const safetyStock = 5;
       
       const rop = Math.ceil((dailyVelocity * supplierLeadTime) + safetyStock);
-      const threshold = prod.low_stock_threshold || prod.lowStockThreshold || 10;
       const status = prod.quantity <= rop ? 'Restock Immediately' : 'Healthy Stock';
       
       const suggestedReorder = status === 'Restock Immediately' ? Math.max(20, Math.ceil(dailyVelocity * 30)) : 0;
@@ -288,7 +295,7 @@ router.get('/restocking-recommendations', authenticateJWT, restrictTo('manager',
 // 4. Customer loyalty & market basket co-occurrence analysis
 router.get('/customer-analysis', authenticateJWT, restrictTo('manager'), async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     let ordersList = [];
     let customersList = [];
@@ -338,14 +345,25 @@ router.get('/customer-analysis', authenticateJWT, restrictTo('manager'), async (
         }
       }
     } else {
-      const { data: orders } = await supabase.from('orders').select('*');
-      ordersList = orders || [];
-      const { data: orderItems } = await supabase.from('order_items').select('*, products(name)');
-      const { data: customers } = await supabase.from('customers').select('*, users(name)');
+      const ordersRes = await supabase.execute('SELECT * FROM orders');
+      ordersList = ordersRes.rows || [];
       
-      customersList = (customers || []).map(c => ({
+      const itemsRes = await supabase.execute(`
+        SELECT oi.*, p.name 
+        FROM order_items oi 
+        LEFT JOIN products p ON oi.product_id = p.id
+      `);
+      const orderItems = itemsRes.rows || [];
+      
+      const customersRes = await supabase.execute(`
+        SELECT c.*, u.name 
+        FROM customers c 
+        LEFT JOIN users u ON c.user_id = u.id
+      `);
+      
+      customersList = (customersRes.rows || []).map(c => ({
         id: c.id,
-        name: c.users ? c.users.name : 'Customer User',
+        name: c.name || 'Customer User',
         loyaltyPoints: c.loyalty_points,
         tier: c.tier
       }));
@@ -359,7 +377,7 @@ router.get('/customer-analysis', authenticateJWT, restrictTo('manager'), async (
           
           const items = (orderItems || []).filter(it => it.order_id === order.id);
           const prodIds = items
-            .map(item => ({ id: String(item.product_id), name: item.products ? item.products.name : 'N/A' }))
+            .map(item => ({ id: String(item.product_id), name: item.name }))
             .filter(p => p.id && p.name && p.name !== 'N/A');
             
           for (let i = 0; i < prodIds.length; i++) {
@@ -394,7 +412,7 @@ router.get('/customer-analysis', authenticateJWT, restrictTo('manager'), async (
       const cIdStr = String(cust.id || cust._id);
       return {
         name: cust.name,
-        loyalty_points: cust.loyaltyPoints || cust.loyalty_points,
+        loyalty_points: cust.loyaltyPoints || cust.loyaltyPoints === 0 ? cust.loyaltyPoints : cust.loyalty_points,
         tier: cust.tier,
         total_spent: parseFloat((spendMap[cIdStr] || 0).toFixed(2))
       };

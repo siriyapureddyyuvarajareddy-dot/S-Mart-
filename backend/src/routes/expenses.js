@@ -7,7 +7,7 @@ const { authenticateJWT, restrictTo } = require('../middleware/auth');
 // 1. Get Expenses (Managers and Admins)
 router.get('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -23,13 +23,11 @@ router.get('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
       return res.json(formatted);
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: expenses, error } = await supabase
-      .from('expenses')
-      .select('*')
-      .order('date', { ascending: false });
-      
-    if (error) throw error;
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: 'SELECT * FROM expenses ORDER BY date DESC'
+    });
+    const expenses = result.rows;
 
     const formatted = expenses.map(e => ({
       id: e.id,
@@ -56,7 +54,7 @@ router.post('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
   }
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     const userId = req.user.id || 'mock_user_1';
     
     if (isOffline) {
@@ -86,32 +84,21 @@ router.post('/', authenticateJWT, restrictTo('manager'), async (req, res) => {
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: expense, error } = await supabase
-      .from('expenses')
-      .insert({
-        title: title.trim(),
-        category: category.trim(),
-        amount: parseFloat(amount),
-        description: description || '',
-        date: date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0],
-        created_by: userId
-      })
-      .select()
-      .single();
-      
-    if (error || !expense) {
-      throw error || new Error('Failed to create expense');
-    }
+    // ONLINE MODE (TURSO)
+    const formattedDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+    const insertRes = await supabase.execute({
+      sql: 'INSERT INTO expenses (title, category, amount, description, date, created_by) VALUES (?, ?, ?, ?, ?, ?)',
+      args: [title.trim(), category.trim(), parseFloat(amount), description || '', formattedDate, userId]
+    });
     
     res.status(201).json({
-      id: expense.id,
-      title: expense.title,
-      category: expense.category,
-      amount: parseFloat(expense.amount),
-      description: expense.description,
-      date: expense.date,
-      created_by: expense.created_by
+      id: Number(insertRes.lastInsertRowid),
+      title: title.trim(),
+      category: category.trim(),
+      amount: parseFloat(amount),
+      description: description || '',
+      date: formattedDate,
+      created_by: userId
     });
   } catch (error) {
     console.error('Create expense error:', error);
@@ -125,7 +112,7 @@ router.put('/:id', authenticateJWT, restrictTo('manager'), async (req, res) => {
   const { title, category, amount, description, date } = req.body;
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -151,14 +138,14 @@ router.put('/:id', authenticateJWT, restrictTo('manager'), async (req, res) => {
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: originalExpense, error } = await supabase
-      .from('expenses')
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: 'SELECT * FROM expenses WHERE id = ?',
+      args: [id]
+    });
+    const originalExpense = result.rows[0];
 
-    if (error || !originalExpense) {
+    if (!originalExpense) {
       return res.status(404).json({ error: 'Expense record not found' });
     }
     
@@ -168,18 +155,10 @@ router.put('/:id', authenticateJWT, restrictTo('manager'), async (req, res) => {
     const nextDescription = description !== undefined ? description : originalExpense.description;
     const nextDate = date ? new Date(date).toISOString().split('T')[0] : originalExpense.date;
 
-    const { error: updErr } = await supabase
-      .from('expenses')
-      .update({
-        title: nextTitle,
-        category: nextCategory,
-        amount: nextAmount,
-        description: nextDescription,
-        date: nextDate
-      })
-      .eq('id', id);
-
-    if (updErr) throw updErr;
+    await supabase.execute({
+      sql: 'UPDATE expenses SET title = ?, category = ?, amount = ?, description = ?, date = ? WHERE id = ?',
+      args: [nextTitle, nextCategory, nextAmount, nextDescription, nextDate, id]
+    });
     
     res.json({
       id: originalExpense.id,
@@ -201,7 +180,7 @@ router.delete('/:id', authenticateJWT, restrictTo('manager'), async (req, res) =
   const { id } = req.params;
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -213,18 +192,21 @@ router.delete('/:id', authenticateJWT, restrictTo('manager'), async (req, res) =
       return res.json({ success: true, message: 'Expense record deleted successfully' });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: expense, error } = await supabase
-      .from('expenses')
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: 'SELECT * FROM expenses WHERE id = ?',
+      args: [id]
+    });
+    const expense = result.rows[0];
 
-    if (error || !expense) {
+    if (!expense) {
       return res.status(404).json({ error: 'Expense record not found' });
     }
     
-    await supabase.from('expenses').delete().eq('id', id);
+    await supabase.execute({
+      sql: 'DELETE FROM expenses WHERE id = ?',
+      args: [id]
+    });
     res.json({ success: true, message: 'Expense record deleted successfully' });
   } catch (error) {
     console.error('Delete expense error:', error);

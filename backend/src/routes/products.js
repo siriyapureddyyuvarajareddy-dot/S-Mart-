@@ -33,7 +33,7 @@ router.get('/', authenticateJWT, async (req, res) => {
   const { search, category, lowStock, expired } = req.query;
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -83,23 +83,30 @@ router.get('/', authenticateJWT, async (req, res) => {
       return res.json(formatted);
     }
 
-    // ONLINE MODE (SUPABASE)
-    let query = supabase
-      .from('products')
-      .select('*, suppliers(name)')
-      .order('created_at', { ascending: false });
-      
+    // ONLINE MODE (TURSO)
+    let sql = 'SELECT p.*, s.name AS supplier_name FROM products p LEFT JOIN suppliers s ON p.supplier_id = s.id';
+    const args = [];
+    const conditions = [];
+    
     if (category) {
-      query = query.eq('category', category);
+      conditions.push('p.category = ?');
+      args.push(category);
     }
     
     if (expired === 'true') {
       const today = new Date().toISOString().split('T')[0];
-      query = query.not('expiry_date', 'is', null).lt('expiry_date', today);
+      conditions.push('p.expiry_date IS NOT NULL AND p.expiry_date < ?');
+      args.push(today);
     }
     
-    let { data: products, error } = await query;
-    if (error) throw error;
+    if (conditions.length > 0) {
+      sql += ' WHERE ' + conditions.join(' AND ');
+    }
+    
+    sql += ' ORDER BY p.created_at DESC';
+    
+    const result = await supabase.execute({ sql, args });
+    let products = result.rows;
     
     // JS Filtering for search query and low stock check
     if (search) {
@@ -127,7 +134,7 @@ router.get('/', authenticateJWT, async (req, res) => {
       low_stock_threshold: p.low_stock_threshold,
       expiry_date: p.expiry_date,
       supplier_id: p.supplier_id,
-      supplier_name: p.suppliers ? p.suppliers.name : 'N/A',
+      supplier_name: p.supplier_name || 'N/A',
       created_at: p.created_at
     }));
     
@@ -143,7 +150,7 @@ router.get('/barcode/:barcode', authenticateJWT, async (req, res) => {
   const { barcode } = req.params;
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -167,14 +174,14 @@ router.get('/barcode/:barcode', authenticateJWT, async (req, res) => {
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: product, error } = await supabase
-      .from('products')
-      .select('*')
-      .eq('barcode', barcode.trim())
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: 'SELECT * FROM products WHERE barcode = ?',
+      args: [barcode.trim()]
+    });
+    const product = result.rows[0];
 
-    if (error || !product) {
+    if (!product) {
       return res.status(404).json({ error: `Product with barcode ${barcode} not found` });
     }
     
@@ -207,7 +214,7 @@ router.post('/', authenticateJWT, restrictTo('manager', 'inventory'), async (req
   }
 
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -262,14 +269,12 @@ router.post('/', authenticateJWT, restrictTo('manager', 'inventory'), async (req
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: duplicate } = await supabase
-      .from('products')
-      .select('*')
-      .eq('name', name.trim())
-      .maybeSingle();
-
-    if (duplicate) {
+    // ONLINE MODE (TURSO)
+    const dupResult = await supabase.execute({
+      sql: 'SELECT * FROM products WHERE name = ?',
+      args: [name.trim()]
+    });
+    if (dupResult.rows.length > 0) {
       return res.status(400).json({ error: `Product with name "${name}" already registered` });
     }
     
@@ -277,46 +282,29 @@ router.post('/', authenticateJWT, restrictTo('manager', 'inventory'), async (req
     const barcode = generateNewBarcode(seed);
     const sku = `SKU-${category.slice(0, 3).toUpperCase()}-${seed}`;
     
-    const { data: newProduct, error: prodErr } = await supabase
-      .from('products')
-      .insert({
-        name: name.trim(),
-        barcode,
-        sku,
-        category,
-        price: parseFloat(price),
-        quantity: parseInt(quantity),
-        unit,
-        low_stock_threshold: parseInt(lowStockThreshold || 15),
-        expiry_date: expiryDate || null,
-        supplier_id: supplierId || null
-      })
-      .select()
-      .single();
-      
-    if (prodErr || !newProduct) {
-      throw prodErr || new Error('Failed to create product');
-    }
+    const prodResult = await supabase.execute({
+      sql: 'INSERT INTO products (name, barcode, sku, category, price, quantity, unit, low_stock_threshold, expiry_date, supplier_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      args: [name.trim(), barcode, sku, category, parseFloat(price), parseInt(quantity), unit, parseInt(lowStockThreshold || 15), expiryDate || null, supplierId || null]
+    });
+    const newProductId = Number(prodResult.lastInsertRowid);
     
-    await supabase.from('stock_logs').insert({
-      product_id: newProduct.id,
-      change_qty: parseInt(quantity),
-      reason: 'restock',
-      user_id: req.user.id
+    await supabase.execute({
+      sql: 'INSERT INTO stock_logs (product_id, change_qty, reason, user_id) VALUES (?, ?, ?, ?)',
+      args: [newProductId, parseInt(quantity), 'restock', req.user.id]
     });
     
     res.status(201).json({
-      id: newProduct.id,
-      name: newProduct.name,
-      barcode: newProduct.barcode,
-      sku: newProduct.sku,
-      category: newProduct.category,
-      price: parseFloat(newProduct.price),
-      quantity: newProduct.quantity,
-      unit: newProduct.unit,
-      low_stock_threshold: newProduct.low_stock_threshold,
-      expiry_date: newProduct.expiry_date,
-      created_at: newProduct.created_at
+      id: newProductId,
+      name: name.trim(),
+      barcode,
+      sku,
+      category,
+      price: parseFloat(price),
+      quantity: parseInt(quantity),
+      unit,
+      low_stock_threshold: parseInt(lowStockThreshold || 15),
+      expiry_date: expiryDate || null,
+      created_at: new Date()
     });
   } catch (error) {
     console.error('Create product error:', error);
@@ -330,7 +318,7 @@ router.put('/:id', authenticateJWT, restrictTo('manager', 'inventory'), async (r
   const { name, price, quantity, unit, lowStockThreshold, expiryDate, supplierId, category } = req.body;
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -379,14 +367,14 @@ router.put('/:id', authenticateJWT, restrictTo('manager', 'inventory'), async (r
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: product, error } = await supabase
-      .from('products')
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const productResult = await supabase.execute({
+      sql: 'SELECT * FROM products WHERE id = ?',
+      args: [id]
+    });
+    const product = productResult.rows[0];
 
-    if (error || !product) {
+    if (!product) {
       return res.status(404).json({ error: 'Product not found' });
     }
     
@@ -394,43 +382,38 @@ router.put('/:id', authenticateJWT, restrictTo('manager', 'inventory'), async (r
     const newQty = quantity !== undefined ? parseInt(quantity) : oldQty;
     const qtyChange = newQty - oldQty;
     
-    const { error: updateErr } = await supabase
-      .from('products')
-      .update({
-        name: name ? name.trim() : product.name,
-        category: category || product.category,
-        price: price !== undefined ? parseFloat(price) : product.price,
-        quantity: newQty,
-        unit: unit || product.unit,
-        low_stock_threshold: lowStockThreshold !== undefined ? parseInt(lowStockThreshold) : product.low_stock_threshold,
-        expiry_date: expiryDate !== undefined ? expiryDate : product.expiry_date,
-        supplier_id: supplierId !== undefined ? supplierId : product.supplier_id
-      })
-      .eq('id', id);
+    const nextName = name ? name.trim() : product.name;
+    const nextCategory = category || product.category;
+    const nextPrice = price !== undefined ? parseFloat(price) : product.price;
+    const nextUnit = unit || product.unit;
+    const nextThreshold = lowStockThreshold !== undefined ? parseInt(lowStockThreshold) : product.low_stock_threshold;
+    const nextExpiry = expiryDate !== undefined ? expiryDate : product.expiry_date;
+    const nextSupplier = supplierId !== undefined ? supplierId : product.supplier_id;
 
-    if (updateErr) throw updateErr;
+    await supabase.execute({
+      sql: 'UPDATE products SET name = ?, category = ?, price = ?, quantity = ?, unit = ?, low_stock_threshold = ?, expiry_date = ?, supplier_id = ? WHERE id = ?',
+      args: [nextName, nextCategory, nextPrice, newQty, nextUnit, nextThreshold, nextExpiry, nextSupplier, id]
+    });
     
     if (qtyChange !== 0) {
       const reason = qtyChange > 0 ? 'restock' : 'adjustment';
-      await supabase.from('stock_logs').insert({
-        product_id: product.id,
-        change_qty: qtyChange,
-        reason,
-        user_id: req.user.id
+      await supabase.execute({
+        sql: 'INSERT INTO stock_logs (product_id, change_qty, reason, user_id) VALUES (?, ?, ?, ?)',
+        args: [id, qtyChange, reason, req.user.id]
       });
     }
     
     res.json({
       id: product.id,
-      name: name ? name.trim() : product.name,
+      name: nextName,
       barcode: product.barcode,
       sku: product.sku,
-      category: category || product.category,
-      price: price !== undefined ? parseFloat(price) : parseFloat(product.price),
+      category: nextCategory,
+      price: parseFloat(nextPrice),
       quantity: newQty,
-      unit: unit || product.unit,
-      low_stock_threshold: lowStockThreshold !== undefined ? parseInt(lowStockThreshold) : product.low_stock_threshold,
-      expiry_date: expiryDate !== undefined ? expiryDate : product.expiry_date,
+      unit: nextUnit,
+      low_stock_threshold: nextThreshold,
+      expiry_date: nextExpiry,
       created_at: product.created_at
     });
   } catch (error) {
@@ -449,7 +432,7 @@ router.post('/:id/adjust', authenticateJWT, restrictTo('manager', 'inventory', '
   }
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -495,40 +478,35 @@ router.post('/:id/adjust', authenticateJWT, restrictTo('manager', 'inventory', '
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: product, error } = await supabase
-      .from('products')
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const productResult = await supabase.execute({
+      sql: 'SELECT * FROM products WHERE id = ?',
+      args: [id]
+    });
+    const product = productResult.rows[0];
 
-    if (error || !product) {
+    if (!product) {
       return res.status(404).json({ error: 'Product not found' });
     }
     
     const newQty = Math.max(0, product.quantity + parseInt(amount));
     const realChange = newQty - product.quantity;
     
-    const { error: updateErr } = await supabase
-      .from('products')
-      .update({ quantity: newQty })
-      .eq('id', id);
-
-    if (updateErr) throw updateErr;
+    await supabase.execute({
+      sql: 'UPDATE products SET quantity = ? WHERE id = ?',
+      args: [newQty, id]
+    });
     
     if (realChange !== 0) {
-      await supabase.from('stock_logs').insert({
-        product_id: product.id,
-        change_qty: realChange,
-        reason,
-        user_id: req.user.id
+      await supabase.execute({
+        sql: 'INSERT INTO stock_logs (product_id, change_qty, reason, user_id) VALUES (?, ?, ?, ?)',
+        args: [id, realChange, reason, req.user.id]
       });
       
       if (newQty <= (product.low_stock_threshold || 10)) {
-        await supabase.from('notifications').insert({
-          title: 'Low Stock Alert',
-          message: `Product "${product.name}" is low on stock (${newQty} ${product.unit} remaining)`,
-          type: 'low_stock'
+        await supabase.execute({
+          sql: 'INSERT INTO notifications (title, message, type) VALUES (?, ?, ?)',
+          args: ['Low Stock Alert', `Product "${product.name}" is low on stock (${newQty} ${product.unit} remaining)`, 'low_stock']
         });
       }
     }
@@ -551,7 +529,7 @@ router.delete('/:id', authenticateJWT, restrictTo('manager', 'inventory'), async
   const { id } = req.params;
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -564,18 +542,21 @@ router.delete('/:id', authenticateJWT, restrictTo('manager', 'inventory'), async
       return res.json({ success: true, message: `Product "${p.name}" successfully deleted.` });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: product, error } = await supabase
-      .from('products')
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const productResult = await supabase.execute({
+      sql: 'SELECT * FROM products WHERE id = ?',
+      args: [id]
+    });
+    const product = productResult.rows[0];
 
-    if (error || !product) {
+    if (!product) {
       return res.status(404).json({ error: 'Product not found' });
     }
     
-    await supabase.from('products').delete().eq('id', id);
+    await supabase.execute({
+      sql: 'DELETE FROM products WHERE id = ?',
+      args: [id]
+    });
     res.json({ success: true, message: `Product "${product.name}" successfully deleted.` });
   } catch (error) {
     console.error('Delete product error:', error);

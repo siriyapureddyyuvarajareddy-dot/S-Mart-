@@ -18,7 +18,7 @@ router.post('/login', async (req, res) => {
   }
 
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -61,14 +61,14 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: user, error: userErr } = await supabase
-      .from('users')
-      .select('*')
-      .or(`username.eq.${username.trim()},email.eq.${username.trim()}`)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const userResult = await supabase.execute({
+      sql: 'SELECT * FROM users WHERE username = ? OR email = ?',
+      args: [username.trim(), username.trim()]
+    });
+    const user = userResult.rows[0];
 
-    if (userErr || !user) {
+    if (!user) {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
 
@@ -89,11 +89,11 @@ router.post('/login', async (req, res) => {
 
     let details = {};
     if (['cashier', 'inventory'].includes(user.role)) {
-      const { data: employee } = await supabase
-        .from('employees')
-        .select('*')
-        .eq('user_id', user.id)
-        .maybeSingle();
+      const empResult = await supabase.execute({
+        sql: 'SELECT * FROM employees WHERE user_id = ?',
+        args: [user.id]
+      });
+      const employee = empResult.rows[0];
       if (employee) {
         details = { shift: employee.shift, salary: employee.salary };
       }
@@ -124,19 +124,18 @@ router.post('/send-otp', async (req, res) => {
   }
 
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     let user;
 
     if (isOffline) {
       await mockDb.initMockDatabase();
       user = mockDb.mockUsers.find(u => u.email.toLowerCase() === email.trim().toLowerCase());
     } else {
-      const { data } = await supabase
-        .from('users')
-        .select('*')
-        .eq('email', email.trim().toLowerCase())
-        .maybeSingle();
-      user = data;
+      const userResult = await supabase.execute({
+        sql: 'SELECT * FROM users WHERE email = ?',
+        args: [email.trim().toLowerCase()]
+      });
+      user = userResult.rows[0];
     }
 
     if (!user) {
@@ -183,7 +182,7 @@ router.post('/verify-otp', async (req, res) => {
     // OTP is valid, remove it
     otpStore.delete(key);
 
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     let user;
 
     if (isOffline) {
@@ -220,15 +219,14 @@ router.post('/verify-otp', async (req, res) => {
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data, error } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', key)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const userResult = await supabase.execute({
+      sql: 'SELECT * FROM users WHERE email = ?',
+      args: [key]
+    });
+    user = userResult.rows[0];
 
-    user = data;
-    if (error || !user) {
+    if (!user) {
       return res.status(404).json({ error: 'User record not found' });
     }
 
@@ -240,11 +238,11 @@ router.post('/verify-otp', async (req, res) => {
 
     let details = {};
     if (['cashier', 'inventory'].includes(user.role)) {
-      const { data: employee } = await supabase
-        .from('employees')
-        .select('*')
-        .eq('user_id', user.id)
-        .maybeSingle();
+      const empResult = await supabase.execute({
+        sql: 'SELECT * FROM employees WHERE user_id = ?',
+        args: [user.id]
+      });
+      const employee = empResult.rows[0];
       if (employee) {
         details = { shift: employee.shift, salary: employee.salary };
       }
@@ -276,7 +274,7 @@ router.post('/register', async (req, res) => {
   }
   
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -322,59 +320,36 @@ router.post('/register', async (req, res) => {
       return res.status(201).json({ success: true, message: 'User registered successfully', userId: newUserId });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: existingUser } = await supabase
-      .from('users')
-      .select('*')
-      .or(`username.eq.${username.trim()},email.eq.${email.trim()}`)
-      .maybeSingle();
-
-    if (existingUser) {
+    // ONLINE MODE (TURSO)
+    const existingResult = await supabase.execute({
+      sql: 'SELECT * FROM users WHERE username = ? OR email = ?',
+      args: [username.trim(), email.trim()]
+    });
+    if (existingResult.rows.length > 0) {
       return res.status(400).json({ error: 'Username or email already registered' });
     }
     
     const passwordHash = await bcrypt.hash(password, 10);
     
-    const { data: newUser, error: userErr } = await supabase
-      .from('users')
-      .insert({
-        username: username.trim(),
-        password_hash: passwordHash,
-        email: email.trim(),
-        role,
-        name
-      })
-      .select()
-      .single();
-    
-    if (userErr || !newUser) {
-      throw userErr || new Error('Failed to create user');
-    }
+    const userResult = await supabase.execute({
+      sql: 'INSERT INTO users (username, password_hash, email, role, name) VALUES (?, ?, ?, ?, ?)',
+      args: [username.trim(), passwordHash, email.trim(), role, name]
+    });
+    const newUserId = Number(userResult.lastInsertRowid);
     
     if (role === 'customer') {
-      const { error: custErr } = await supabase
-        .from('customers')
-        .insert({
-          user_id: newUser.id,
-          loyalty_points: 0,
-          phone: phone || '',
-          address: address || '',
-          tier: 'Silver'
-        });
-      if (custErr) throw custErr;
+      await supabase.execute({
+        sql: 'INSERT INTO customers (user_id, loyalty_points, phone, address, tier) VALUES (?, 0, ?, ?, ?)',
+        args: [newUserId, phone || '', address || '', 'Silver']
+      });
     } else if (['cashier', 'inventory', 'manager'].includes(role)) {
-      const { error: empErr } = await supabase
-        .from('employees')
-        .insert({
-          user_id: newUser.id,
-          salary: parseFloat(salary || 18000),
-          shift: shift || 'morning',
-          status: 'active'
-        });
-      if (empErr) throw empErr;
+      await supabase.execute({
+        sql: 'INSERT INTO employees (user_id, salary, shift, status) VALUES (?, ?, ?, ?)',
+        args: [newUserId, parseFloat(salary || 18000), shift || 'morning', 'active']
+      });
     }
     
-    res.status(201).json({ success: true, message: 'User registered successfully', userId: newUser.id });
+    res.status(201).json({ success: true, message: 'User registered successfully', userId: newUserId });
   } catch (error) {
     console.error('Registration error:', error);
     res.status(500).json({ error: 'Failed to register user' });
@@ -384,7 +359,7 @@ router.post('/register', async (req, res) => {
 // 3. Get Current Profile
 router.get('/me', authenticateJWT, async (req, res) => {
   try {
-    const isOffline = !process.env.SUPABASE_URL || !process.env.SUPABASE_KEY;
+    const isOffline = !process.env.TURSO_DATABASE_URL;
     
     if (isOffline) {
       await mockDb.initMockDatabase();
@@ -417,33 +392,33 @@ router.get('/me', authenticateJWT, async (req, res) => {
       });
     }
 
-    // ONLINE MODE (SUPABASE)
-    const { data: user, error } = await supabase
-      .from('users')
-      .select('*')
-      .eq('id', req.user.id)
-      .maybeSingle();
+    // ONLINE MODE (TURSO)
+    const userResult = await supabase.execute({
+      sql: 'SELECT * FROM users WHERE id = ?',
+      args: [req.user.id]
+    });
+    const user = userResult.rows[0];
 
-    if (error || !user) {
+    if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
     
     let details = {};
     if (user.role === 'customer') {
-      const { data: customer } = await supabase
-        .from('customers')
-        .select('*')
-        .eq('user_id', user.id)
-        .maybeSingle();
+      const custResult = await supabase.execute({
+        sql: 'SELECT * FROM customers WHERE user_id = ?',
+        args: [user.id]
+      });
+      const customer = custResult.rows[0];
       if (customer) {
         details = { loyaltyPoints: customer.loyalty_points, phone: customer.phone, address: customer.address, tier: customer.tier };
       }
     } else if (['cashier', 'inventory'].includes(user.role)) {
-      const { data: employee } = await supabase
-        .from('employees')
-        .select('*')
-        .eq('user_id', user.id)
-        .maybeSingle();
+      const empResult = await supabase.execute({
+        sql: 'SELECT * FROM employees WHERE user_id = ?',
+        args: [user.id]
+      });
+      const employee = empResult.rows[0];
       if (employee) {
         details = { shift: employee.shift, salary: employee.salary, status: employee.status };
       }
