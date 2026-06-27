@@ -11,8 +11,16 @@ export const AppContext = createContext();
 
 const getAPI_BASE = () => {
   if (import.meta.env.VITE_API_BASE) return import.meta.env.VITE_API_BASE;
-  const host = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
-  return `http://${host}:5000/api`;
+  if (typeof window !== 'undefined') {
+    if (window.location.port && window.location.port !== '5173') {
+      return `${window.location.protocol}//${window.location.host}/api`;
+    }
+    if (!window.location.port && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+      return `${window.location.protocol}//${window.location.host}/api`;
+    }
+    return `http://${window.location.hostname}:5000/api`;
+  }
+  return 'http://127.0.0.1:5000/api';
 };
 export const API_BASE = getAPI_BASE();
 

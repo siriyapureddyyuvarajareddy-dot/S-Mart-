@@ -37,9 +37,21 @@ app.use('/api/analytics', analyticsRouter);
 app.use('/api/notifications', notificationsRouter);
 app.use('/api/expenses', expensesRouter);
 
+// Serve static frontend assets in production
+const frontendDistPath = path.join(__dirname, '../../frontend/dist');
+app.use(express.static(frontendDistPath));
+
 // Base route for server checking
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', system: 'S Mart Server API Hub', timestamp: new Date() });
+});
+
+// Fallback all non-API GET requests to serve frontend index.html (Client-Side Routing)
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/health')) {
+    return next();
+  }
+  res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
 
 // Run DB Initialization and Start server
