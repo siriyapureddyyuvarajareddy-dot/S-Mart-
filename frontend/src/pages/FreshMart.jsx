@@ -191,21 +191,7 @@ export default function FreshMart({ onOpenLogin }) {
               Visit our neighborhood grocery storefront to explore organic fresh veggies, pantry treats, daily dairy essentials, bakery goods, and personal care necessities.
             </p>
 
-            <div className="flex flex-col sm:flex-row items-center justify-center lg:justify-start gap-4">
-              <button 
-                onClick={() => scrollToSection('location')}
-                className="w-full sm:w-auto px-8 py-3.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-bold text-sm shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2 group cursor-pointer border-none"
-              >
-                <span>Visit Our Store</span>
-                <ArrowRight className="w-4 h-4 transition-transform group-hover:translate-x-1" />
-              </button>
-              <button 
-                onClick={() => scrollToSection('categories')}
-                className="w-full sm:w-auto px-8 py-3.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded-2xl font-bold text-sm shadow-sm transition-all cursor-pointer"
-              >
-                Browse Categories
-              </button>
-            </div>
+
           </div>
 
           {/* Hero image */}
