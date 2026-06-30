@@ -123,12 +123,6 @@ export default function FreshMart({ onOpenLogin }) {
           {/* Desktop Nav links */}
           <nav className="hidden md:flex items-center gap-7 text-sm font-semibold text-slate-600">
             <button onClick={() => scrollToSection('home')} className="hover:text-emerald-700 transition-colors border-none bg-transparent cursor-pointer">Home</button>
-            <button onClick={() => scrollToSection('about')} className="hover:text-emerald-700 transition-colors border-none bg-transparent cursor-pointer">About Us</button>
-            <button onClick={() => scrollToSection('categories')} className="hover:text-emerald-700 transition-colors border-none bg-transparent cursor-pointer">Categories</button>
-            <button onClick={() => scrollToSection('offers')} className="hover:text-emerald-700 transition-colors border-none bg-transparent cursor-pointer">Offers</button>
-            <button onClick={() => scrollToSection('gallery')} className="hover:text-emerald-700 transition-colors border-none bg-transparent cursor-pointer">Gallery</button>
-            <button onClick={() => scrollToSection('location')} className="hover:text-emerald-700 transition-colors border-none bg-transparent cursor-pointer">Location</button>
-            <button onClick={() => scrollToSection('contact')} className="hover:text-emerald-700 transition-colors border-none bg-transparent cursor-pointer">Contact Us</button>
           </nav>
 
           {/* Action buttons */}
@@ -154,12 +148,6 @@ export default function FreshMart({ onOpenLogin }) {
         {mobileMenuOpen && (
           <div className="md:hidden bg-white border-b border-slate-100 py-4 px-6 flex flex-col gap-4 shadow-inner">
             <button onClick={() => scrollToSection('home')} className="text-left py-1 text-sm font-semibold text-slate-600 hover:text-emerald-700 border-none bg-transparent cursor-pointer">Home</button>
-            <button onClick={() => scrollToSection('about')} className="text-left py-1 text-sm font-semibold text-slate-600 hover:text-emerald-700 border-none bg-transparent cursor-pointer">About Us</button>
-            <button onClick={() => scrollToSection('categories')} className="text-left py-1 text-sm font-semibold text-slate-600 hover:text-emerald-700 border-none bg-transparent cursor-pointer">Categories</button>
-            <button onClick={() => scrollToSection('offers')} className="text-left py-1 text-sm font-semibold text-slate-600 hover:text-emerald-700 border-none bg-transparent cursor-pointer">Offers</button>
-            <button onClick={() => scrollToSection('gallery')} className="text-left py-1 text-sm font-semibold text-slate-600 hover:text-emerald-700 border-none bg-transparent cursor-pointer">Gallery</button>
-            <button onClick={() => scrollToSection('location')} className="text-left py-1 text-sm font-semibold text-slate-600 hover:text-emerald-700 border-none bg-transparent cursor-pointer">Location</button>
-            <button onClick={() => scrollToSection('contact')} className="text-left py-1 text-sm font-semibold text-slate-600 hover:text-emerald-700 border-none bg-transparent cursor-pointer">Contact Us</button>
             <button 
               onClick={onOpenLogin}
               className="mt-2 w-full py-2.5 rounded-xl text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white text-center shadow-md transition-all cursor-pointer border-none"
