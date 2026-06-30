@@ -622,4 +622,126 @@ router.get('/invoice/:orderId', authenticateJWT, async (req, res) => {
   }
 });
 
+// 5. Daily Revenue Settle Report
+router.get('/settle-report', authenticateJWT, async (req, res) => {
+  const targetDate = req.query.date || new Date().toISOString().split('T')[0];
+  
+  try {
+    const isOffline = !process.env.TURSO_DATABASE_URL;
+    
+    if (isOffline) {
+      await mockDb.initMockDatabase();
+      const matchedOrders = mockDb.mockOrders.filter(o => {
+        const oDate = new Date(o.createdAt).toISOString().split('T')[0];
+        return oDate === targetDate;
+      });
+
+      const list = matchedOrders.map(o => {
+        let customerName = 'Walk-in Customer';
+        if (o.customerId) {
+          const cust = mockDb.mockCustomers.find(c => String(c._id) === String(o.customerId) || String(c.userId) === String(o.customerId));
+          if (cust) {
+            const userObj = mockDb.mockUsers.find(u => String(u._id) === String(cust.userId));
+            if (userObj) customerName = userObj.name;
+          }
+        }
+        
+        const cashierObj = mockDb.mockUsers.find(u => String(u._id) === String(o.cashierId));
+        
+        return {
+          id: o._id,
+          invoiceNumber: `SMART-INV-${o._id}`,
+          customerName,
+          cashierName: cashierObj ? cashierObj.name : 'System',
+          finalAmount: o.finalAmount || o.totalAmount,
+          paymentMethod: o.paymentMethod || 'cash',
+          createdAt: o.createdAt || new Date()
+        };
+      });
+
+      // Calculate aggregates
+      let totalRevenue = 0;
+      let upiRevenue = 0;
+      let cashRevenue = 0;
+      let otherRevenue = 0;
+
+      list.forEach(o => {
+        totalRevenue += o.finalAmount;
+        if (o.paymentMethod === 'upi' || o.paymentMethod === 'razorpay') {
+          upiRevenue += o.finalAmount;
+        } else if (o.paymentMethod === 'cash') {
+          cashRevenue += o.finalAmount;
+        } else {
+          otherRevenue += o.finalAmount;
+        }
+      });
+
+      return res.json({
+        date: targetDate,
+        summary: {
+          totalRevenue,
+          upiRevenue,
+          cashRevenue,
+          otherRevenue
+        },
+        transactions: list
+      });
+    }
+
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: `SELECT o.id, o.final_amount, o.payment_method, o.created_at, 
+            u.name AS customer_name, cu.name AS cashier_name
+            FROM orders o
+            LEFT JOIN customers c ON o.customer_id = c.id
+            LEFT JOIN users u ON c.user_id = u.id
+            LEFT JOIN users cu ON o.cashier_id = cu.id
+            WHERE date(o.created_at) = date(?) 
+               OR strftime('%Y-%m-%d', o.created_at) = ?`,
+      args: [targetDate, targetDate]
+    });
+
+    const list = result.rows.map(o => ({
+      id: o.id,
+      invoiceNumber: `SMART-INV-${o.id}`,
+      customerName: o.customer_name || 'Walk-in Customer',
+      cashierName: o.cashier_name || 'System',
+      finalAmount: parseFloat(o.final_amount),
+      paymentMethod: o.payment_method || 'cash',
+      createdAt: o.created_at
+    }));
+
+    // Calculate aggregates
+    let totalRevenue = 0;
+    let upiRevenue = 0;
+    let cashRevenue = 0;
+    let otherRevenue = 0;
+
+    list.forEach(o => {
+      totalRevenue += o.finalAmount;
+      if (o.paymentMethod === 'upi' || o.paymentMethod === 'razorpay') {
+        upiRevenue += o.finalAmount;
+      } else if (o.paymentMethod === 'cash') {
+        cashRevenue += o.finalAmount;
+      } else {
+        otherRevenue += o.finalAmount;
+      }
+    });
+
+    res.json({
+      date: targetDate,
+      summary: {
+        totalRevenue,
+        upiRevenue,
+        cashRevenue,
+        otherRevenue
+      },
+      transactions: list
+    });
+  } catch (error) {
+    console.error('Fetch settle report error:', error);
+    res.status(500).json({ error: 'Failed to retrieve daily settlement report' });
+  }
+});
+
 module.exports = router;
