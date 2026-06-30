@@ -523,7 +523,7 @@ export default function CashierBilling() {
             <div id="invoice-print-area" className="p-4 border border-dashed border-slate-300 rounded-2xl bg-slate-50/50 space-y-3 font-mono">
               <div className="text-center pb-2 border-b border-dashed border-slate-200">
                 <h2 className="text-sm font-extrabold uppercase">S Mart Supermarket</h2>
-                <p className="text-[10px] text-slate-400 font-bold mt-0.5">Bangalore, KA - 560066</p>
+                <p className="text-[10px] text-slate-400 font-bold mt-0.5">Simhadripuram, Kadapa 516454</p>
                 <p className="text-[9px] text-slate-400 mt-1">Receipt: {checkoutResult.invoiceNumber}</p>
               </div>
 
@@ -556,16 +556,8 @@ export default function CashierBilling() {
                 </div>
               </div>
 
-              {/* QR Invoice and thank you note */}
-              <div className="text-center pt-2 space-y-2 border-t border-dashed border-slate-200">
-                <p className="text-[9px] text-slate-400 uppercase font-bold">Scan for Digital Invoice</p>
-                {checkoutResult.qrCode && (
-                  <img 
-                    src={checkoutResult.qrCode} 
-                    alt="Invoice QR" 
-                    className="w-24 h-24 mx-auto border border-slate-100 rounded-lg bg-white" 
-                  />
-                )}
+              {/* Thank you note */}
+              <div className="text-center pt-2 border-t border-dashed border-slate-200">
                 <p className="text-[9px] text-slate-400 uppercase font-bold mt-1">Thank you for shopping at S Mart!</p>
               </div>
             </div>
