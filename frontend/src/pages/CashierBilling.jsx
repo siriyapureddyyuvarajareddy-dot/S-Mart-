@@ -25,15 +25,59 @@ export default function CashierBilling() {
   const [paymentMethod, setPaymentMethod] = useState('cash');
   const [checkoutResult, setCheckoutResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [salesHistory, setSalesHistory] = useState([]);
 
   // Scanner states
   const [showScanner, setShowScanner] = useState(false);
   const scannerRef = useRef(null);
 
-  // Focus barcode input on load
+  const fetchSalesHistory = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/billing/history`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSalesHistory(data);
+      }
+    } catch (err) {
+      console.error('Error loading sales history:', err);
+    }
+  };
+
+  const handleSelectRecentSale = async (orderId) => {
+    try {
+      const res = await fetch(`${API_BASE}/billing/invoice/${orderId}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCheckoutResult({
+          invoiceNumber: `SMART-INV-${data.order.id}`,
+          items: data.items.map(it => ({
+            name: it.name,
+            quantity: it.quantity,
+            subtotal: it.subtotal
+          })),
+          subtotal: data.order.total_amount,
+          gstAmount: data.order.gst_amount,
+          discountAmount: data.order.discount_amount,
+          finalAmount: data.order.final_amount
+        });
+      } else {
+        triggerToast('Failed to load invoice details', 'error');
+      }
+    } catch (err) {
+      console.error(err);
+      triggerToast('Error connecting to server', 'error');
+    }
+  };
+
+  // Focus barcode input and fetch history on load
   const barcodeInputRef = useRef(null);
   useEffect(() => {
     if (barcodeInputRef.current) barcodeInputRef.current.focus();
+    fetchSalesHistory();
   }, []);
 
   // Search product dropdown by typing query
@@ -224,6 +268,7 @@ export default function CashierBilling() {
         setFoundCustomer(null);
         setCustomerPhone('');
         setRedeemPoints(false);
+        fetchSalesHistory();
       } else {
         triggerToast(data.error || 'Failed to submit order', 'error');
       }
@@ -505,6 +550,46 @@ export default function CashierBilling() {
             <ShoppingCart className="w-4 h-4" />
             {loading ? 'Finalizing...' : 'Finalize Checkout'}
           </button>
+        </div>
+
+        {/* Recent Transactions List */}
+        <div className="bg-white border border-slate-150 rounded-3xl p-5 space-y-4 shadow-sm">
+          <div className="flex justify-between items-center">
+            <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+              <Printer className="w-4 h-4 text-emerald-600" /> Recent Sales History
+            </h3>
+            <span className="bg-slate-100 px-2 py-0.5 rounded text-[9px] font-bold text-slate-500">
+              Last {salesHistory.length}
+            </span>
+          </div>
+
+          {salesHistory.length === 0 ? (
+            <p className="text-slate-400 text-[10px] text-center py-6">No recent sales found.</p>
+          ) : (
+            <div className="divide-y divide-slate-100 overflow-y-auto max-h-60 text-xs">
+              {salesHistory.map(sale => (
+                <div 
+                  key={sale.id}
+                  onClick={() => handleSelectRecentSale(sale.id)}
+                  className="py-2.5 flex justify-between items-center cursor-pointer hover:bg-slate-50 rounded-lg px-2 -mx-2 transition-colors"
+                  title="Click to view receipt"
+                >
+                  <div className="text-left">
+                    <p className="font-bold text-slate-800">{sale.invoiceNumber}</p>
+                    <p className="text-[9px] text-slate-400 mt-0.5">
+                      {new Date(sale.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • {sale.itemsCount} {sale.itemsCount === 1 ? 'item' : 'items'}
+                    </p>
+                  </div>
+                  <div className="text-right">
+                    <p className="font-extrabold text-slate-900">₹{sale.finalAmount.toFixed(2)}</p>
+                    <span className="text-[8px] bg-slate-100 text-slate-500 rounded px-1 capitalize py-0.5 font-bold">
+                      {sale.paymentMethod}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 

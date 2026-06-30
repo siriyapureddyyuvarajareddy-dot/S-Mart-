@@ -457,6 +457,47 @@ router.post('/verify-payment', authenticateJWT, async (req, res) => {
   }
 });
 
+// 3. Get recent orders history
+router.get('/history', authenticateJWT, async (req, res) => {
+  try {
+    const isOffline = !process.env.TURSO_DATABASE_URL;
+    if (isOffline) {
+      await mockDb.initMockDatabase();
+      const list = mockDb.mockOrders.map(o => ({
+        id: o._id,
+        invoiceNumber: `SMART-INV-${o._id}`,
+        finalAmount: o.finalAmount || o.totalAmount,
+        paymentMethod: o.paymentMethod || 'cash',
+        createdAt: o.createdAt || new Date(),
+        itemsCount: o.items ? o.items.length : 1
+      }));
+      return res.json(list.reverse().slice(0, 15));
+    }
+
+    // ONLINE MODE (TURSO)
+    const result = await supabase.execute({
+      sql: `SELECT o.id, o.final_amount, o.payment_method, o.created_at, 
+            (SELECT COUNT(*) FROM order_items WHERE order_id = o.id) as items_count
+            FROM orders o 
+            ORDER BY o.created_at DESC LIMIT 15`
+    });
+
+    const list = result.rows.map(o => ({
+      id: o.id,
+      invoiceNumber: `SMART-INV-${o.id}`,
+      finalAmount: parseFloat(o.final_amount),
+      paymentMethod: o.payment_method,
+      createdAt: o.created_at,
+      itemsCount: Number(o.items_count)
+    }));
+
+    res.json(list);
+  } catch (error) {
+    console.error('Fetch orders history error:', error);
+    res.status(500).json({ error: 'Failed to retrieve transaction history' });
+  }
+});
+
 // 4. Retrieve single Invoice details
 router.get('/invoice/:orderId', authenticateJWT, async (req, res) => {
   const { orderId } = req.params;
